@@ -1,0 +1,65 @@
+services:
+  livekit-server:
+    image: livekit/livekit-server:latest
+    command: --config /etc/livekit.yaml --dev
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7880"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    ports:
+      - "8083:8000"
+    environment:
+      - WHISPER__MODEL=Systran/faster-whisper-base
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  tts:
+    build: ./tts-service
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8082/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  agent:
+    build: ./backend
+    env_file: .env
+    environment:
+      - LIVEKIT_URL=ws://livekit-server:7880
+      - OPENAI_STT_BASE_URL=http://whisper:8000/v1
+      - OPENAI_TTS_BASE_URL=http://tts:8082/v1
+    depends_on:
+      - livekit-server
+      - whisper
+      - tts
+
+  token-server:
+    build: ./backend
+    command: ["uvicorn", "token_server:app", "--host", "0.0.0.0", "--port", "8081"]
+    ports:
+      - "8081:8081"
+    env_file: .env
+    depends_on:
+      - livekit-server
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - token-server
