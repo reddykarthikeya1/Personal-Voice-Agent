@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from livekit.api import AccessToken, VideoGrants
 import uvicorn
 import asyncpg
-from typing import List
+from typing import List, Optional
 
 app = FastAPI(title="LiveKit Token & History Server")
 
@@ -32,6 +32,7 @@ class MessageItem(BaseModel):
 class ConversationItem(BaseModel):
     id: int
     room_name: str
+    title: Optional[str] = None
     created_at: str
 
 @app.on_event("startup")
@@ -57,6 +58,7 @@ async def shutdown():
 async def get_token(
     room: str = Query(default="default-room"),
     identity: str = Query(default="user"),
+    voice: Optional[str] = Query(default=None),
 ):
     token = (
         AccessToken(api_key=API_KEY, api_secret=API_SECRET)
@@ -64,6 +66,8 @@ async def get_token(
         .with_name(identity)
         .with_grants(VideoGrants(room_join=True, room=room))
     )
+    if voice:
+        token.with_attributes({"voice": voice})
 
     return TokenResponse(token=token.to_jwt())
 
@@ -74,7 +78,7 @@ async def list_conversations():
     
     async with app.state.db_pool.acquire() as conn:
         try:
-            rows = await conn.fetch("SELECT id, room_name, created_at::text FROM conversations ORDER BY created_at DESC")
+            rows = await conn.fetch("SELECT id, room_name, title, created_at::text FROM conversations ORDER BY created_at DESC")
             return [dict(row) for row in rows]
         except Exception as e:
             # Table might not exist yet if agent hasn't booted

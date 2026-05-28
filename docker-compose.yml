@@ -60,12 +60,16 @@ services:
       - LIVEKIT_URL=ws://livekit-server:7880
       - OPENAI_STT_BASE_URL=http://whisper:8000/v1
       - OPENAI_TTS_BASE_URL=http://tts:8082/v1
+      - KOKORO_TTS_URL=http://kokoro-tts:8880/v1
+      - TTS_PROVIDER=edge-tts
     depends_on:
       livekit-server:
         condition: service_healthy
       whisper:
         condition: service_healthy
       tts:
+        condition: service_healthy
+      kokoro-tts:
         condition: service_healthy
       db:
         condition: service_healthy
@@ -88,6 +92,17 @@ services:
       - "3000:80"
     depends_on:
       - token-server
+
+  kokoro-tts:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    ports:
+      - "8880:8880"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8880/health\")'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
 volumes:
   pgdata:

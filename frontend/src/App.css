@@ -367,12 +367,22 @@ html, body, #root {
 }
 
 .status-desc {
-  font-size: 1.4rem;
+  font-size: 1.2rem;
   font-weight: 300;
   color: var(--text-primary);
   text-align: center;
-  height: 36px;
+  min-height: 72px;
+  max-height: 160px;
+  max-width: 600px;
+  line-height: 1.5;
   letter-spacing: 0.5px;
+  overflow-y: auto;
+  scrollbar-width: none; /* Hide scrollbar for Firefox */
+  padding: 0 10px;
+}
+
+.status-desc::-webkit-scrollbar {
+  display: none; /* Hide scrollbar for Chrome/Safari */
 }
 
 /* Bottom Controls */

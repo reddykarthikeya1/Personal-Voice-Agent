@@ -38,7 +38,7 @@ const TOKEN_SERVER_URL = getTokenServerUrl();
 
 // Component to handle individual session layout & voice visualization
 function DashboardContent({ onDisconnect }) {
-  const { state: agentState, audioTrack } = useVoiceAssistant();
+  const { state: agentState, audioTrack, agentTranscriptions } = useVoiceAssistant();
   const { localParticipant } = useLocalParticipant();
   const { chatMessages } = useChat();
   const [showTranscript, setShowTranscript] = useState(true);
@@ -47,11 +47,19 @@ function DashboardContent({ onDisconnect }) {
   const [selectedPastConv, setSelectedPastConv] = useState(null);
   const [pastMessages, setPastMessages] = useState([]);
   const chatEndRef = useRef(null);
+  const statusDescRef = useRef(null);
 
   // Scroll chat to bottom on new messages
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages, activeTab, selectedPastConv]);
+
+  // Auto scroll status description to bottom when it changes (for long transcriptions)
+  useEffect(() => {
+    if (statusDescRef.current) {
+      statusDescRef.current.scrollTop = statusDescRef.current.scrollHeight;
+    }
+  }, [agentState, agentTranscriptions]);
 
   // Handle mic toggle
   const isMuted = localParticipant ? !localParticipant.isMicrophoneEnabled : false;
@@ -107,7 +115,11 @@ function DashboardContent({ onDisconnect }) {
       case 'thinking':
         return { label: 'Thinking', desc: 'Formulating a smart response...' };
       case 'speaking':
-        return { label: 'Speaking', desc: 'Synthesizing voice...' };
+        const lastSegment = agentTranscriptions && agentTranscriptions.length > 0
+          ? agentTranscriptions[agentTranscriptions.length - 1]
+          : null;
+        const transcript = lastSegment ? lastSegment.text : '';
+        return { label: 'Speaking', desc: transcript || 'Synthesizing voice...' };
       default:
         return { label: 'Ready', desc: 'Awaiting your command...' };
     }
@@ -146,12 +158,12 @@ function DashboardContent({ onDisconnect }) {
         <div className="header">
           <div className="brand">
             <div className="logo-dot" />
-            <h2>PERSONAL VOICE AGENT</h2>
+            <h2>KAY</h2>
           </div>
           
           <div className="status-badge">
             <div className={`badge-dot ${getOrbStateClass()}`} />
-            <span>AGENT ONLINE</span>
+            <span>KAY ONLINE</span>
           </div>
         </div>
 
@@ -176,7 +188,7 @@ function DashboardContent({ onDisconnect }) {
           {/* Status Indicators */}
           <div className="status-container">
             <div className="status-label">{status.label}</div>
-            <div className="status-desc">{status.desc}</div>
+            <div className="status-desc" ref={statusDescRef}>{status.desc}</div>
           </div>
 
           {/* Live Neon Frequency Audio Wave Bars (Glow visualizer) */}
@@ -247,10 +259,24 @@ function DashboardContent({ onDisconnect }) {
               </div>
             ) : (
               chatMessages.map((msg, idx) => {
-                const isUser = msg.from?.identity !== 'agent' && !msg.from?.identity?.includes('agent');
+                let isUser = msg.from?.identity !== 'agent' && !msg.from?.identity?.includes('agent');
+                let text = msg.message;
+                try {
+                  const parsed = JSON.parse(msg.message);
+                  if (parsed && typeof parsed === 'object') {
+                    if (parsed.sender) {
+                      isUser = parsed.sender === 'user';
+                    }
+                    if (parsed.text) {
+                      text = parsed.text;
+                    }
+                  }
+                } catch (e) {
+                  // Fallback to plain text message
+                }
                 return (
                   <div key={idx} className={`chat-bubble-wrapper ${isUser ? 'user' : 'agent'}`}>
-                    <div className="bubble">{msg.message}</div>
+                    <div className="bubble">{text}</div>
                     <div className="bubble-meta">
                       {isUser ? 'You' : 'Agent'}
                     </div>
@@ -266,10 +292,20 @@ function DashboardContent({ onDisconnect }) {
             {selectedPastConv ? (
               /* INDIVIDUAL PAST SESSION MESSAGES */
               <div className="history-chat-view">
-                <button className="back-btn" onClick={() => setSelectedPastConv(null)}>
-                  <ArrowLeft size={16} />
-                  <span>Back to Sessions</span>
-                </button>
+                <div style={{ display: 'flex', justifyItems: 'center', justifyContent: 'space-between', marginBottom: '15px' }}>
+                  <button className="back-btn" onClick={() => setSelectedPastConv(null)} style={{ margin: 0 }}>
+                    <ArrowLeft size={16} />
+                    <span>Back to Sessions</span>
+                  </button>
+                  <button 
+                    className="btn-circle btn-accent" 
+                    onClick={() => onDisconnect(selectedPastConv)}
+                    style={{ width: 'auto', borderRadius: '50px', padding: '0 20px', height: '36px', fontSize: '0.85rem', display: 'flex', gap: '6px', margin: 0 }}
+                  >
+                    <Play size={14} fill="white" />
+                    <span>Continue Session</span>
+                  </button>
+                </div>
                 <div className="chat-scroll">
                   {pastMessages.length === 0 ? (
                     <p className="no-msgs">No messages found in this session.</p>
@@ -302,7 +338,7 @@ function DashboardContent({ onDisconnect }) {
                     {pastConversations.map((conv) => (
                       <div key={conv.id} className="session-card" onClick={() => loadPastSession(conv.room_name)}>
                         <div className="session-card-header">
-                          <span className="session-title">Session #{conv.id}</span>
+                          <span className="session-title">{conv.title || `Session #${conv.id}`}</span>
                           <Calendar size={14} className="text-gray-500" />
                         </div>
                         <span className="session-date">{formatDate(conv.created_at)}</span>
@@ -328,6 +364,8 @@ function App() {
   const [pastConversations, setPastConversations] = useState([]);
   const [selectedPastConv, setSelectedPastConv] = useState(null);
   const [pastMessages, setPastMessages] = useState([]);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [selectedVoice, setSelectedVoice] = useState('alloy');
 
   // Fetch past conversations for connect screen history
   const fetchPastConversations = async () => {
@@ -342,7 +380,7 @@ function App() {
     }
   };
 
-  // Fetch past messages
+  // Fetch messages of a past conversation session
   const loadPastSession = async (roomName) => {
     try {
       const res = await fetch(`${TOKEN_SERVER_URL}/conversations/${roomName}/messages`);
@@ -367,16 +405,30 @@ function App() {
     setPastMessages([]);
   };
 
-  const connect = useCallback(async () => {
+  const connect = useCallback(async (existingRoomName = null, isInitial = false) => {
     setIsConnecting(true);
     setError(null);
+    
+    let finalRoomName = null;
+    let finalIsInitial = false;
+    
+    if (typeof existingRoomName === 'boolean') {
+      finalIsInitial = existingRoomName;
+    } else {
+      finalRoomName = existingRoomName;
+      finalIsInitial = isInitial;
+    }
+    
+    if (finalIsInitial) {
+      setInitialLoading(true);
+    }
 
     try {
-      const roomName = `voice-agent-${Date.now()}`;
+      const roomName = finalRoomName || `voice-agent-${Date.now()}`;
       const participantName = `user-${Math.random().toString(36).slice(2, 8)}`;
 
       const res = await fetch(
-        `${TOKEN_SERVER_URL}/token?room=${roomName}&identity=${participantName}`
+        `${TOKEN_SERVER_URL}/token?room=${roomName}&identity=${participantName}&voice=${selectedVoice}`
       );
 
       if (!res.ok) {
@@ -385,16 +437,30 @@ function App() {
 
       const data = await res.json();
       setToken(data.token);
+      setInitialLoading(false);
     } catch (err) {
       setError(err.message);
+      setInitialLoading(false);
     } finally {
       setIsConnecting(false);
     }
-  }, []);
+  }, [selectedVoice]);
 
-  const disconnect = useCallback(() => {
+  const disconnect = useCallback((targetRoomName = null) => {
     setToken(null);
-  }, []);
+    setInitialLoading(false);
+    if (typeof targetRoomName === 'string') {
+      setInitialLoading(true);
+      setTimeout(() => {
+        connect(targetRoomName);
+      }, 500);
+    }
+  }, [connect]);
+
+  // Auto connect on component mount
+  useEffect(() => {
+    connect(true);
+  }, [connect]);
 
   // Format date helper
   const formatDate = (dateStr) => {
@@ -426,6 +492,23 @@ function App() {
       </LiveKitRoom>
     );
   }
+  if (initialLoading) {
+    return (
+      <div className="app">
+        <div className="ambient-bg" />
+        <div className="connect-screen">
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '20px' }}>
+            <div className="connect-icon-wrapper" style={{ width: '80px', height: '80px', borderRadius: '24px', background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Sparkles size={32} className="animate-pulse text-violet-400" />
+            </div>
+            <div style={{ fontSize: '0.85rem', fontWeight: '500', color: 'rgba(255,255,255,0.35)', letterSpacing: '2px', textTransform: 'uppercase' }}>
+              Connecting to KAY...
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
@@ -433,32 +516,65 @@ function App() {
       <div className="ambient-bg" />
 
       <div className="connect-screen">
-        <div className="connect-container">
-          <div className="connect-icon-wrapper">
-            <Sparkles size={38} className="animate-pulse" />
+        <div className="connect-container" style={{ maxWidth: '380px', padding: '30px 25px', gap: '20px' }}>
+          <div className="connect-icon-wrapper" style={{ width: '54px', height: '54px', borderRadius: '16px', marginBottom: '0px' }}>
+            <Sparkles size={26} className="animate-pulse" />
           </div>
-          <h1>Personal Voice Agent</h1>
-          <p>
-            Experience dynamic, real-time voice interactions driven by local Whisper STT, 
-            Edge-TTS, and a powerful DGX-hosted Qwen LLM.
-          </p>
+          <h1 style={{ fontSize: '1.8rem', letterSpacing: '1px', marginBottom: '0px' }}>KAY</h1>
 
-          <div style={{ display: 'flex', gap: '16px', marginTop: '10px' }}>
+          {/* Premium Glassmorphic Voice Selector Dropdown (Item 4) */}
+          <div className="voice-select-wrapper" style={{ width: '100%', marginTop: '5px', marginBottom: '5px' }}>
+            <label style={{ fontSize: '0.65rem', textTransform: 'uppercase', letterSpacing: '2px', color: 'rgba(255,255,255,0.35)', display: 'block', marginBottom: '8px', textAlign: 'left', fontWeight: '600' }}>
+              Assistant Voice
+            </label>
+            <select
+              value={selectedVoice}
+              onChange={(e) => setSelectedVoice(e.target.value)}
+              className="voice-select"
+              style={{
+                width: '100%',
+                padding: '12px 16px',
+                background: 'rgba(255,255,255,0.03)',
+                border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: '12px',
+                color: '#fff',
+                fontSize: '0.85rem',
+                outline: 'none',
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+                appearance: 'none',
+                backgroundImage: 'url("data:image/svg+xml;charset=UTF-8,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'24\' height=\'24\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'rgba%28255,255,255,0.4%29\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'%3E%3Cpolyline points=\'6 9 12 15 18 9\'%3E%3C/polyline%3E%3C/svg%3E")',
+                backgroundRepeat: 'no-repeat',
+                backgroundPosition: 'right 16px center',
+                backgroundSize: '16px',
+                paddingRight: '40px',
+              }}
+            >
+              <option value="alloy" style={{ background: '#0d0822', color: '#fff' }}>Kay (Default Female - Aria)</option>
+              <option value="nova" style={{ background: '#0d0822', color: '#fff' }}>Jenny (Soft Female - Jenny)</option>
+              <option value="shimmer" style={{ background: '#0d0822', color: '#fff' }}>Amber (Warm Female - Amber)</option>
+              <option value="echo" style={{ background: '#0d0822', color: '#fff' }}>Guy (Smooth Male - Guy)</option>
+              <option value="onyx" style={{ background: '#0d0822', color: '#fff' }}>Davis (Deep Male - Davis)</option>
+              <option value="fable" style={{ background: '#0d0822', color: '#fff' }}>Sonia (British Female - Sonia)</option>
+            </select>
+          </div>
+
+          <div style={{ display: 'flex', gap: '12px', marginTop: '5px', width: '100%', justifyContent: 'center' }}>
             <button
               className="btn-circle btn-accent"
               onClick={connect}
               disabled={isConnecting}
-              style={{ width: 'auto', borderRadius: '50px', padding: '0 40px', display: 'flex', gap: '10px' }}
+              style={{ width: 'auto', flex: 1, borderRadius: '50px', padding: '0 30px', display: 'flex', gap: '8px', fontSize: '0.9rem', height: '48px' }}
             >
               {isConnecting ? (
                 <>
-                  <RotateCw size={18} className="animate-spin" />
+                  <RotateCw size={16} className="animate-spin" />
                   <span>Connecting...</span>
                 </>
               ) : (
                 <>
-                  <Play size={18} fill="white" />
-                  <span>Start Conversation</span>
+                  <Play size={16} fill="white" />
+                  <span>Connect</span>
                 </>
               )}
             </button>
@@ -468,13 +584,13 @@ function App() {
               className="btn-circle"
               onClick={openHistory}
               title="Saved Conversation History"
-              style={{ background: 'rgba(255,255,255,0.05)' }}
+              style={{ background: 'rgba(255,255,255,0.05)', width: '48px', height: '48px' }}
             >
-              <History size={22} />
+              <History size={20} />
             </button>
           </div>
 
-          {error && <p className="error">{error}</p>}
+          {error && <p className="error" style={{ fontSize: '0.85rem', marginTop: '10px' }}>{error}</p>}
         </div>
       </div>
 
@@ -494,10 +610,20 @@ function App() {
               {selectedPastConv ? (
                 /* Saved Messages view */
                 <div className="history-chat-view">
-                  <button className="back-btn" onClick={() => setSelectedPastConv(null)}>
-                    <ArrowLeft size={16} />
-                    <span>Back to Sessions</span>
-                  </button>
+                  <div style={{ display: 'flex', justifyItems: 'center', justifyContent: 'space-between', marginBottom: '15px' }}>
+                    <button className="back-btn" onClick={() => setSelectedPastConv(null)} style={{ margin: 0 }}>
+                      <ArrowLeft size={16} />
+                      <span>Back to Sessions</span>
+                    </button>
+                    <button 
+                      className="btn-circle btn-accent" 
+                      onClick={() => { closeHistory(); connect(selectedPastConv); }}
+                      style={{ width: 'auto', borderRadius: '50px', padding: '0 20px', height: '36px', fontSize: '0.85rem', display: 'flex', gap: '6px', margin: 0 }}
+                    >
+                      <Play size={14} fill="white" />
+                      <span>Continue Session</span>
+                    </button>
+                  </div>
                   <div className="chat-scroll" style={{ maxHeight: '400px' }}>
                     {pastMessages.length === 0 ? (
                       <p className="no-msgs">No messages found in this session.</p>
@@ -527,7 +653,7 @@ function App() {
                     pastConversations.map((conv) => (
                       <div key={conv.id} className="session-card" onClick={() => loadPastSession(conv.room_name)}>
                         <div className="session-card-header">
-                          <span className="session-title">Session #{conv.id}</span>
+                          <span className="session-title">{conv.title || `Session #${conv.id}`}</span>
                           <Calendar size={14} className="text-gray-500" />
                         </div>
                         <span className="session-date">{formatDate(conv.created_at)}</span>
