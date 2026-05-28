@@ -20,11 +20,11 @@ services:
     environment:
       - WHISPER__MODEL=Systran/faster-whisper-base
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 120s
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/v1/models\")'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   tts:
     build: ./tts-service
