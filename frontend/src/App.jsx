@@ -532,7 +532,7 @@ function App() {
                         </div>
                         <span className="session-date">{formatDate(conv.created_at)}</span>
                       </div>
-                    ))}
+                    ))
                   )}
                 </div>
               )}
