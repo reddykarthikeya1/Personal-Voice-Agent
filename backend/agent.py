@@ -160,7 +160,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # We capture the full generated assistant response here to avoid truncation (Fix for Item 5)
         if event.old_state == "speaking" and event.new_state != "speaking":
             assistant_msg = None
-            for msg in reversed(chat_ctx.messages):
+            for msg in reversed(session.history.messages()):
                 if msg.role == "assistant":
                     assistant_msg = msg
                     break
@@ -318,7 +318,13 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     logger.info("Agent session started, waiting for user speech...")
-    session.generate_reply(instructions="Greet the user warmly, introduce yourself as Kay, and ask how you can help them.")
+    # Use session.say() instead of generate_reply so the greeting goes directly to TTS
+    # without an LLM call (avoids "no user query" error with Qwen and similar models)
+    if past_messages:
+        greeting = "Welcome back! I remember our previous conversation. What would you like to talk about?"
+    else:
+        greeting = "Hi there! I'm Kay, your personal voice assistant. How can I help you today?"
+    session.say(greeting)
 
 
 if __name__ == "__main__":
