@@ -36,6 +36,23 @@ services:
       timeout: 3s
       retries: 5
 
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      - POSTGRES_DB=voice_agent
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgrespassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d voice_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   agent:
     build: ./backend
     env_file: .env
@@ -44,9 +61,14 @@ services:
       - OPENAI_STT_BASE_URL=http://whisper:8000/v1
       - OPENAI_TTS_BASE_URL=http://tts:8082/v1
     depends_on:
-      - livekit-server
-      - whisper
-      - tts
+      livekit-server:
+        condition: service_healthy
+      whisper:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
+      db:
+        condition: service_healthy
 
   token-server:
     build: ./backend
@@ -55,7 +77,10 @@ services:
       - "8081:8081"
     env_file: .env
     depends_on:
-      - livekit-server
+      livekit-server:
+        condition: service_healthy
+      db:
+        condition: service_healthy
 
   frontend:
     build: ./frontend
@@ -63,3 +88,6 @@ services:
       - "3000:80"
     depends_on:
       - token-server
+
+volumes:
+  pgdata:

@@ -1,5 +1,7 @@
 import os
 import logging
+import asyncio
+import asyncpg
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -28,6 +30,55 @@ def prewarm(proc: JobProcess) -> None:
 async def entrypoint(ctx: JobContext) -> None:
     logger.info("Agent joining room: %s", ctx.room.name)
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
+    # Initialize PostgreSQL connection and tables
+    db_url = os.getenv("POSTGRES_URL", "postgresql://postgres:postgrespassword@db:5432/voice_agent")
+    
+    # Establish connection with retry logic since DB might take a second to boot up
+    conn = None
+    for attempt in range(10):
+        try:
+            conn = await asyncpg.connect(db_url)
+            logger.info("Successfully connected to PostgreSQL database.")
+            break
+        except Exception as e:
+            logger.warning(f"Failed to connect to PostgreSQL (attempt {attempt+1}/10): {e}")
+            await asyncio.sleep(2)
+            
+    db_conv_id = None
+    if conn:
+        try:
+            # Create tables
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id SERIAL PRIMARY KEY,
+                    room_name VARCHAR(255) UNIQUE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    conversation_id INT REFERENCES conversations(id) ON DELETE CASCADE,
+                    role VARCHAR(50),
+                    content TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            
+            # Insert current room
+            await conn.execute(
+                "INSERT INTO conversations (room_name) VALUES ($1) ON CONFLICT (room_name) DO NOTHING",
+                ctx.room.name
+            )
+            
+            # Fetch conversation ID
+            row = await conn.fetchrow("SELECT id FROM conversations WHERE room_name = $1", ctx.room.name)
+            if row:
+                db_conv_id = row['id']
+                logger.info(f"Initialized persistent conversation log in DB. Conv ID: {db_conv_id}")
+            
+            await conn.close()
+        except Exception as e:
+            logger.error(f"Error initializing database schema: {e}")
 
     # LLM
     llm_instance = openai.LLM(
@@ -60,6 +111,7 @@ async def entrypoint(ctx: JobContext) -> None:
         stt=stt_instance,
         llm=llm_instance,
         tts=tts_instance,
+        use_tts_aligned_transcript=True,
     )
 
     # Start session - don't close on disconnect
@@ -72,6 +124,28 @@ async def entrypoint(ctx: JobContext) -> None:
     @session.on("agent_state_changed")
     def on_agent_state(event) -> None:
         logger.info(f"--- AGENT STATE CHANGED: {event.old_state} -> {event.new_state}")
+
+    @session.on("conversation_item_added")
+    def on_conversation_item(event) -> None:
+        item = event.item
+        if hasattr(item, 'role') and hasattr(item, 'content') and item.content and db_conv_id:
+            role = 'agent' if item.role == 'assistant' else 'user'
+            content = item.content
+            
+            # Save message asynchronously
+            async def save_to_db():
+                try:
+                    c = await asyncpg.connect(db_url)
+                    await c.execute(
+                        "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3)",
+                        db_conv_id, role, content
+                    )
+                    await c.close()
+                    logger.info(f"Saved message to DB: {role}: '{content[:30]}...'")
+                except Exception as ex:
+                    logger.error(f"Error saving message to DB: {ex}")
+            
+            asyncio.create_task(save_to_db())
 
     @session.on("error")
     def on_session_error(event) -> None:
