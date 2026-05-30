@@ -1,20 +1,25 @@
 services:
   livekit-server:
     image: livekit/livekit-server:latest
-    command: --config /etc/livekit.yaml --dev
+    command: --config /etc/livekit.yaml
+    restart: always
     ports:
       - "7880:7880"
       - "7881:7881"
+      - "7882:7882/udp"
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml
+    # X16: Added start_period to prevent premature health check failures
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:7880"]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 15s
 
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
+    restart: always
     ports:
       - "8083:8000"
     environment:
@@ -28,13 +33,16 @@ services:
 
   tts:
     build: ./tts-service
+    restart: always
     ports:
       - "8082:8082"
+    # X16: Added start_period to tts service healthcheck
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8082/health"]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 15s
 
   db:
     image: postgres:15-alpine
@@ -44,17 +52,20 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgrespassword
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432" # Lock down DB access to localhost only
     volumes:
       - pgdata:/var/lib/postgresql/data
+    # X16: Added start_period to db service healthcheck
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d voice_agent"]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 15s
 
   agent:
     build: ./backend
+    restart: always
     env_file: .env
     environment:
       - LIVEKIT_URL=ws://livekit-server:7880
@@ -69,14 +80,20 @@ services:
         condition: service_healthy
       tts:
         condition: service_healthy
-      kokoro-tts:
-        condition: service_healthy
       db:
         condition: service_healthy
+    # X17: Added process-level healthcheck to check if the python worker is running
+    healthcheck:
+      test: ["CMD-SHELL", "ps -ef | grep -v grep | grep agent.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   token-server:
     build: ./backend
     command: ["uvicorn", "token_server:app", "--host", "0.0.0.0", "--port", "8081"]
+    restart: always
     ports:
       - "8081:8081"
     env_file: .env
@@ -85,16 +102,32 @@ services:
         condition: service_healthy
       db:
         condition: service_healthy
+    # X16: Added start_period to token-server service healthcheck
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
 
   frontend:
     build: ./frontend
+    restart: always
     ports:
       - "3000:80"
     depends_on:
-      - token-server
+      token-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   kokoro-tts:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    restart: always
     ports:
       - "8880:8880"
     healthcheck:

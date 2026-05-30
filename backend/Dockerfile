@@ -18,5 +18,5 @@ COPY token_server.py .
 # Expose port for token server
 EXPOSE 8081
 
-# Run the agent in dev mode
-CMD ["python", "agent.py", "dev"]
+# Run the agent in start mode for production
+CMD ["python", "agent.py", "start"]

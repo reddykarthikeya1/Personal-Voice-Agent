@@ -1,6 +1,6 @@
 # 🎙️ Personal Voice Agent
 
-A sophisticated, ultra-responsive, real-time voice assistant built with a modern stack leveraging **LiveKit**, **Faster-Whisper** (Speech-to-Text), **Edge-TTS** (Text-to-Speech), and **Qwen LLM** (vLLM) running on a high-performance DGX cluster.
+A sophisticated, ultra-responsive, real-time voice assistant built with a modern stack leveraging **LiveKit**, **Faster-Whisper** (Speech-to-Text), **Edge-TTS** (Text-to-Speech), and **Qwen LLM** (vLLM) running on a high-performance GPU cluster.
 
 This project delivers a seamless voice interaction experience through a high-performance Selective Forwarding Unit (SFU) with minimal latency and a beautiful, dynamic frontend.
 
@@ -12,7 +12,7 @@ This project delivers a seamless voice interaction experience through a high-per
 graph TD
     Client[React Frontend / Browser] <-->|WebRTC / Audio & Control| LK[LiveKit Server]
     Agent[Python Agent Worker] <-->|WebRTC Subscription & Publishing| LK
-    Agent <-->|API Calls| LLM[Qwen LLM / DGX Cluster]
+    Agent <-->|API Calls| LLM[Qwen LLM / High-Performance GPU Cluster]
     Agent <-->|Transcriptions| STT[Faster Whisper STT Server]
     Agent <-->|Audio Synthesis| TTS[Edge TTS Server]
 ```
@@ -23,7 +23,7 @@ graph TD
 3. **Agent Worker (Python)**: Subscribes to room audio events, processes speech using Voice Activity Detection (Silero VAD), and coordinates STT, LLM, and TTS pipelines.
 4. **Faster-Whisper (STT)**: A local container running high-accuracy, CPU-optimized whisper-base model for instant speech transcriptions.
 5. **Edge-TTS (TTS)**: An OpenAI-compatible local TTS microservice wrapping Microsoft Edge's high-quality neural voices.
-6. **Qwen LLM**: A vLLM server hosted on a remote high-performance DGX GPU cluster for blazing-fast, conversational answers.
+6. **Qwen LLM**: A vLLM server hosted on a remote high-performance GPU cluster for blazing-fast, conversational answers.
 
 ---
 
@@ -48,8 +48,8 @@ cp .env.example .env
 ```
 Ensure your `.env` contains the correct LLM settings:
 ```ini
-OPENAI_API_KEY=sk-jP9e4uwInf...
-OPENAI_BASE_URL=https://dgx-hyd.rite.digital/v1
+OPENAI_API_KEY=sk-your-api-key-here
+OPENAI_BASE_URL=https://gpu-cluster.yourdomain.com/v1
 OPENAI_MODEL=qwen3.6
 ```
 

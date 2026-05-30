@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   LiveKitRoom,
   useVoiceAssistant,
@@ -21,23 +21,91 @@ import {
   ArrowLeft,
   Calendar,
   MessageCircle,
+  AlertCircle,
 } from 'lucide-react';
 import '@livekit/components-styles';
 
-// In Docker, token-server is on the same host but port 8081
+// H8: Shared fetch & date utility functions to eliminate duplicate code
 const getTokenServerUrl = () => {
   if (import.meta.env.VITE_TOKEN_SERVER_URL) {
     return import.meta.env.VITE_TOKEN_SERVER_URL;
   }
-  // Use same host with port 8081
   const { protocol, hostname } = window.location;
   return `${protocol}//${hostname}:8081`;
 };
 
 const TOKEN_SERVER_URL = getTokenServerUrl();
 
+const fetchConversationsAPI = async () => {
+  const res = await fetch(`${TOKEN_SERVER_URL}/conversations`);
+  if (!res.ok) {
+    throw new Error(`Failed to load sessions list (HTTP ${res.status})`);
+  }
+  return res.json();
+};
+
+const fetchSessionMessagesAPI = async (roomName) => {
+  const res = await fetch(`${TOKEN_SERVER_URL}/conversations/${roomName}/messages`);
+  if (!res.ok) {
+    throw new Error(`Failed to load messages (HTTP ${res.status})`);
+  }
+  return res.json();
+};
+
+const formatDateHelper = (dateStr) => {
+  try {
+    const d = new Date(dateStr);
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  } catch (e) {
+    return dateStr;
+  }
+};
+
+// H6: Standard Error Boundary Component to prevent white screen crashes
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error("ErrorBoundary caught an uncaught React error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="app" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#0d0822', color: '#fff' }}>
+          <div className="ambient-bg" />
+          <div className="connect-container" style={{ maxWidth: '440px', padding: '40px 30px', textAlign: 'center', gap: '20px' }}>
+            <div className="connect-icon-wrapper" style={{ width: '64px', height: '64px', borderRadius: '20px', background: 'rgba(239,68,68,0.1)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.2)' }}>
+              <AlertCircle size={28} />
+            </div>
+            <h2 style={{ fontSize: '1.5rem', fontWeight: '600' }}>Application Crash Detected</h2>
+            <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: '0.9rem', lineHeight: '1.5' }}>
+              {this.state.error?.message || "An unexpected rendering error occurred inside the assistant client."}
+            </p>
+            <button
+              className="btn-circle btn-accent"
+              onClick={() => window.location.reload()}
+              style={{ width: 'auto', borderRadius: '50px', padding: '0 30px', fontSize: '0.9rem', height: '44px', marginTop: '10px' }}
+            >
+              Restart Application
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // Component to handle individual session layout & voice visualization
-function DashboardContent({ onDisconnect }) {
+function DashboardContent({ onHangUp, onReconnect }) {
   const { state: agentState, audioTrack, agentTranscriptions } = useVoiceAssistant();
   const { localParticipant } = useLocalParticipant();
   const { chatMessages } = useChat();
@@ -46,13 +114,25 @@ function DashboardContent({ onDisconnect }) {
   const [pastConversations, setPastConversations] = useState([]);
   const [selectedPastConv, setSelectedPastConv] = useState(null);
   const [pastMessages, setPastMessages] = useState([]);
-  const chatEndRef = useRef(null);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState(null);
+  const activeChatEndRef = useRef(null);
+  const historyChatEndRef = useRef(null);
   const statusDescRef = useRef(null);
 
-  // Scroll chat to bottom on new messages
+  // Scroll active chat to bottom on new messages
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatMessages, activeTab, selectedPastConv]);
+    if (activeTab === 'active') {
+      activeChatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [chatMessages, activeTab]);
+
+  // Scroll history chat to bottom when loaded or selected
+  useEffect(() => {
+    if (activeTab === 'history' && selectedPastConv && !isHistoryLoading) {
+      historyChatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [pastMessages, activeTab, selectedPastConv, isHistoryLoading]);
 
   // Auto scroll status description to bottom when it changes (for long transcriptions)
   useEffect(() => {
@@ -69,30 +149,34 @@ function DashboardContent({ onDisconnect }) {
     }
   }, [localParticipant, isMuted]);
 
-  // Fetch past conversations
+  // Fetch past conversations (handles non-OK states - H7)
   const fetchPastConversations = async () => {
+    setIsHistoryLoading(true);
+    setHistoryError(null);
     try {
-      const res = await fetch(`${TOKEN_SERVER_URL}/conversations`);
-      if (res.ok) {
-        const data = await res.json();
-        setPastConversations(data);
-      }
+      const data = await fetchConversationsAPI();
+      setPastConversations(data);
     } catch (e) {
       console.error('Error fetching past sessions:', e);
+      setHistoryError(e.message || 'Failed to retrieve saved history.');
+    } finally {
+      setIsHistoryLoading(false);
     }
   };
 
-  // Fetch specific past session messages
+  // Fetch specific past session messages (handles loading spinner - M13, and errors - H7)
   const loadPastSession = async (roomName) => {
+    setIsHistoryLoading(true);
+    setHistoryError(null);
     try {
-      const res = await fetch(`${TOKEN_SERVER_URL}/conversations/${roomName}/messages`);
-      if (res.ok) {
-        const data = await res.json();
-        setPastMessages(data);
-        setSelectedPastConv(roomName);
-      }
+      const data = await fetchSessionMessagesAPI(roomName);
+      setPastMessages(data);
+      setSelectedPastConv(roomName);
     } catch (e) {
       console.error('Error loading session messages:', e);
+      setHistoryError(e.message || 'Failed to load conversation history.');
+    } finally {
+      setIsHistoryLoading(false);
     }
   };
 
@@ -111,7 +195,7 @@ function DashboardContent({ onDisconnect }) {
       case 'initializing':
         return { label: 'Initializing', desc: 'Syncing cognitive systems...' };
       case 'listening':
-        return { label: 'Listening', desc: 'Go ahead, I\'m listening closely...' };
+        return { label: 'Listening', desc: "Go ahead, I'm listening closely..." };
       case 'thinking':
         return { label: 'Thinking', desc: 'Formulating a smart response...' };
       case 'speaking':
@@ -136,15 +220,31 @@ function DashboardContent({ onDisconnect }) {
     return '';
   };
 
-  // Format date helper
-  const formatDate = (dateStr) => {
-    try {
-      const d = new Date(dateStr);
-      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    } catch (e) {
-      return dateStr;
-    }
-  };
+  // M9: Parse JSON chat messages once on receipt and memoize output to prevent render lag
+  const formattedChatMessages = useMemo(() => {
+    return chatMessages.map((msg, idx) => {
+      let isUser = msg.from?.identity !== 'agent' && !msg.from?.identity?.includes('agent');
+      let text = msg.message;
+      try {
+        const parsed = JSON.parse(msg.message);
+        if (parsed && typeof parsed === 'object') {
+          if (parsed.sender) {
+            isUser = parsed.sender === 'user';
+          }
+          if (parsed.text) {
+            text = parsed.text;
+          }
+        }
+      } catch (e) {
+        // Fallback to plain text
+      }
+      return {
+        id: msg.id || `msg-${idx}`,
+        isUser,
+        text
+      };
+    });
+  }, [chatMessages]);
 
   return (
     <div className={`dashboard-grid ${showTranscript ? '' : 'minimal'}`}>
@@ -197,12 +297,13 @@ function DashboardContent({ onDisconnect }) {
           </div>
         </div>
 
-        {/* Dashboard Control Buttons */}
+        {/* Dashboard Control Buttons - H17: Accessibility descriptive aria-labels added */}
         <div className="controls-container">
           {/* Mute/Unmute Microphone */}
           <button
             className={`btn-circle ${isMuted ? 'btn-red' : 'active'}`}
             onClick={toggleMic}
+            aria-label={isMuted ? 'Unmute microphone' : 'Mute microphone'}
             title={isMuted ? 'Unmute Mic' : 'Mute Mic'}
           >
             {isMuted ? <MicOff size={22} /> : <Mic size={22} />}
@@ -212,6 +313,7 @@ function DashboardContent({ onDisconnect }) {
           <button
             className={`btn-circle ${showTranscript ? 'active' : ''}`}
             onClick={() => setShowTranscript(!showTranscript)}
+            aria-label="Toggle chat transcript panel"
             title="Toggle Transcript Panel"
           >
             <MessageSquare size={22} />
@@ -220,7 +322,8 @@ function DashboardContent({ onDisconnect }) {
           {/* Terminate Connection */}
           <button
             className="btn-circle btn-red"
-            onClick={onDisconnect}
+            onClick={() => onHangUp()}
+            aria-label="Disconnect active voice call"
             title="Disconnect"
           >
             <PhoneOff size={22} />
@@ -231,11 +334,15 @@ function DashboardContent({ onDisconnect }) {
       {/* RIGHT STAGE: Glassmorphism Live Transcript & History */}
       <div className="transcript-panel">
         
-        {/* Navigation Tabs */}
-        <div className="tab-header">
+        {/* Navigation Tabs - X6: ARIA tablist/tab accessibility roles added */}
+        <div className="tab-header" role="tablist" aria-label="Session logs tabs">
           <button
             className={`tab-btn ${activeTab === 'active' ? 'active' : ''}`}
             onClick={() => { setActiveTab('active'); setSelectedPastConv(null); }}
+            role="tab"
+            aria-selected={activeTab === 'active'}
+            aria-controls="active-session-panel"
+            id="active-session-tab"
           >
             <MessageCircle size={16} />
             <span>Active Session</span>
@@ -243,6 +350,10 @@ function DashboardContent({ onDisconnect }) {
           <button
             className={`tab-btn ${activeTab === 'history' ? 'active' : ''}`}
             onClick={() => setActiveTab('history')}
+            role="tab"
+            aria-selected={activeTab === 'history'}
+            aria-controls="saved-history-panel"
+            id="saved-history-tab"
           >
             <History size={16} />
             <span>Saved History</span>
@@ -251,84 +362,90 @@ function DashboardContent({ onDisconnect }) {
 
         {activeTab === 'active' ? (
           /* ACTIVE SESSION VIEW */
-          <div className="chat-scroll">
-            {chatMessages.length === 0 ? (
+          <div className="chat-scroll" id="active-session-panel" role="tabpanel" aria-labelledby="active-session-tab">
+            {formattedChatMessages.length === 0 ? (
               <div className="chat-empty">
                 <Cpu size={48} className="text-gray-700 animate-pulse" />
                 <p>Say hello to your personal voice assistant to start the conversation!</p>
               </div>
             ) : (
-              chatMessages.map((msg, idx) => {
-                let isUser = msg.from?.identity !== 'agent' && !msg.from?.identity?.includes('agent');
-                let text = msg.message;
-                try {
-                  const parsed = JSON.parse(msg.message);
-                  if (parsed && typeof parsed === 'object') {
-                    if (parsed.sender) {
-                      isUser = parsed.sender === 'user';
-                    }
-                    if (parsed.text) {
-                      text = parsed.text;
-                    }
-                  }
-                } catch (e) {
-                  // Fallback to plain text message
-                }
-                return (
-                  <div key={idx} className={`chat-bubble-wrapper ${isUser ? 'user' : 'agent'}`}>
-                    <div className="bubble">{text}</div>
-                    <div className="bubble-meta">
-                      {isUser ? 'You' : 'Agent'}
-                    </div>
+              formattedChatMessages.map((msg) => (
+                <div key={msg.id} className={`chat-bubble-wrapper ${msg.isUser ? 'user' : 'agent'}`}>
+                  <div className="bubble">{msg.text}</div>
+                  <div className="bubble-meta">
+                    {msg.isUser ? 'You' : 'Agent'}
                   </div>
-                );
-              })
+                </div>
+              ))
             )}
-            <div ref={chatEndRef} />
+            <div ref={activeChatEndRef} />
           </div>
         ) : (
           /* SAVED HISTORY VIEW */
-          <div className="history-container">
+          <div className="history-container" id="saved-history-panel" role="tabpanel" aria-labelledby="saved-history-tab">
             {selectedPastConv ? (
               /* INDIVIDUAL PAST SESSION MESSAGES */
               <div className="history-chat-view">
-                <div style={{ display: 'flex', justifyItems: 'center', justifyContent: 'space-between', marginBottom: '15px' }}>
-                  <button className="back-btn" onClick={() => setSelectedPastConv(null)} style={{ margin: 0 }}>
+                <div style={{ display: 'flex', justifyItems: 'center', justifyContent: 'space-between', padding: '15px', borderBottom: '1px solid var(--glass-border)', background: 'rgba(0,0,0,0.1)' }}>
+                  <button className="back-btn" onClick={() => setSelectedPastConv(null)} style={{ margin: 0, padding: '0 10px', width: 'auto', background: 'transparent', border: 'none' }}>
                     <ArrowLeft size={16} />
-                    <span>Back to Sessions</span>
+                    <span>Sessions</span>
                   </button>
                   <button 
                     className="btn-circle btn-accent" 
-                    onClick={() => onDisconnect(selectedPastConv)}
+                    onClick={() => onReconnect(selectedPastConv)}
                     style={{ width: 'auto', borderRadius: '50px', padding: '0 20px', height: '36px', fontSize: '0.85rem', display: 'flex', gap: '6px', margin: 0 }}
                   >
                     <Play size={14} fill="white" />
-                    <span>Continue Session</span>
+                    <span>Continue</span>
                   </button>
                 </div>
-                <div className="chat-scroll">
-                  {pastMessages.length === 0 ? (
-                    <p className="no-msgs">No messages found in this session.</p>
-                  ) : (
-                    pastMessages.map((msg, idx) => {
-                      const isUser = msg.role === 'user';
-                      return (
-                        <div key={idx} className={`chat-bubble-wrapper ${isUser ? 'user' : 'agent'}`}>
-                          <div className="bubble">{msg.content}</div>
-                          <div className="bubble-meta">
-                            {isUser ? 'You' : 'Agent'}
+                
+                {isHistoryLoading ? (
+                  <div className="history-empty">
+                    <RotateCw size={32} className="animate-spin text-violet-400" />
+                    <p>Loading session messages...</p>
+                  </div>
+                ) : historyError ? (
+                  <div className="history-empty text-red-500">
+                    <AlertCircle size={32} />
+                    <p>{historyError}</p>
+                  </div>
+                ) : (
+                  <div className="chat-scroll">
+                    {pastMessages.length === 0 ? (
+                      <p className="no-msgs">No messages found in this session.</p>
+                    ) : (
+                      pastMessages.map((msg, idx) => {
+                        const isUser = msg.role === 'user';
+                        return (
+                          <div key={`past-${idx}`} className={`chat-bubble-wrapper ${isUser ? 'user' : 'agent'}`}>
+                            <div className="bubble">{msg.content}</div>
+                            <div className="bubble-meta">
+                              {isUser ? 'You' : 'Agent'}
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })
-                  )}
-                  <div ref={chatEndRef} />
-                </div>
+                        );
+                      })
+                    )}
+                    <div ref={historyChatEndRef} />
+                  </div>
+                )}
               </div>
             ) : (
               /* LIST OF SAVED SESSIONS */
               <div className="history-list-view">
-                {pastConversations.length === 0 ? (
+                {isHistoryLoading ? (
+                  <div className="history-empty">
+                    <RotateCw size={32} className="animate-spin text-violet-400" />
+                    <p>Loading saved sessions...</p>
+                  </div>
+                ) : historyError ? (
+                  <div className="history-empty text-red-500">
+                    <AlertCircle size={32} />
+                    <p>{historyError}</p>
+                  </div>
+                ) : pastConversations.length === 0 ? (
                   <div className="history-empty">
                     <History size={40} className="text-gray-700" />
                     <p>No saved conversation logs found yet.</p>
@@ -336,13 +453,19 @@ function DashboardContent({ onDisconnect }) {
                 ) : (
                   <div className="session-list">
                     {pastConversations.map((conv) => (
-                      <div key={conv.id} className="session-card" onClick={() => loadPastSession(conv.room_name)}>
+                      <button
+                        key={conv.id}
+                        className="session-card"
+                        onClick={() => loadPastSession(conv.room_name)}
+                        style={{ width: '100%', background: 'transparent', textAlign: 'left', border: '1px solid var(--glass-border)', display: 'block' }}
+                        aria-label={`View conversation from ${formatDateHelper(conv.created_at)}`}
+                      >
                         <div className="session-card-header">
                           <span className="session-title">{conv.title || `Session #${conv.id}`}</span>
                           <Calendar size={14} className="text-gray-500" />
                         </div>
-                        <span className="session-date">{formatDate(conv.created_at)}</span>
-                      </div>
+                        <span className="session-date">{formatDateHelper(conv.created_at)}</span>
+                      </button>
                     ))}
                   </div>
                 )}
@@ -364,33 +487,59 @@ function App() {
   const [pastConversations, setPastConversations] = useState([]);
   const [selectedPastConv, setSelectedPastConv] = useState(null);
   const [pastMessages, setPastMessages] = useState([]);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
   const [selectedVoice, setSelectedVoice] = useState('alloy');
+  
+  // X5: Separate historyError state to prevent leak to the connect screen
+  const [historyError, setHistoryError] = useState(null);
 
-  // Fetch past conversations for connect screen history
-  const fetchPastConversations = async () => {
-    try {
-      const res = await fetch(`${TOKEN_SERVER_URL}/conversations`);
-      if (res.ok) {
-        const data = await res.json();
-        setPastConversations(data);
+  // C5 & H9: Ref to store active reconnection timer to prevent leaks on unmount
+  const reconnectTimeoutRef = useRef(null);
+
+  // M8: Ref to store voice state so that the connect callback does NOT re-trigger on voice changes
+  const selectedVoiceRef = useRef(selectedVoice);
+  useEffect(() => {
+    selectedVoiceRef.current = selectedVoice;
+  }, [selectedVoice]);
+
+  // Clean up timer on unmount
+  useEffect(() => {
+    return () => {
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
       }
+    };
+  }, []);
+
+  // Fetch past conversations for connect screen history (handles non-OK states - H7)
+  const fetchPastConversations = async () => {
+    setIsHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const data = await fetchConversationsAPI();
+      setPastConversations(data);
     } catch (e) {
       console.error(e);
+      setHistoryError(e.message || 'Failed to retrieve saved history.');
+    } finally {
+      setIsHistoryLoading(false);
     }
   };
 
-  // Fetch messages of a past conversation session
+  // Fetch messages of a past conversation session (handles loading state - M13, and errors - H7)
   const loadPastSession = async (roomName) => {
+    setIsHistoryLoading(true);
+    setHistoryError(null);
     try {
-      const res = await fetch(`${TOKEN_SERVER_URL}/conversations/${roomName}/messages`);
-      if (res.ok) {
-        const data = await res.json();
-        setPastMessages(data);
-        setSelectedPastConv(roomName);
-      }
+      const data = await fetchSessionMessagesAPI(roomName);
+      setPastMessages(data);
+      setSelectedPastConv(roomName);
     } catch (e) {
       console.error(e);
+      setHistoryError(e.message || 'Failed to load conversation history.');
+    } finally {
+      setIsHistoryLoading(false);
     }
   };
 
@@ -403,36 +552,30 @@ function App() {
     setShowHistoryModal(false);
     setSelectedPastConv(null);
     setPastMessages([]);
+    setHistoryError(null);
   };
 
-  const connect = useCallback(async (existingRoomName = null, isInitial = false) => {
+  // M7: Clean connect callback, completely eliminating parameter overloading
+  const connect = useCallback(async (roomName = null, isInitial = false) => {
     setIsConnecting(true);
     setError(null);
     
-    let finalRoomName = null;
-    let finalIsInitial = false;
-    
-    if (typeof existingRoomName === 'boolean') {
-      finalIsInitial = existingRoomName;
-    } else {
-      finalRoomName = existingRoomName;
-      finalIsInitial = isInitial;
-    }
-    
-    if (finalIsInitial) {
+    if (isInitial) {
       setInitialLoading(true);
     }
 
     try {
-      const roomName = finalRoomName || `voice-agent-${Date.now()}`;
+      const targetRoom = roomName || `voice-agent-${Date.now()}`;
       const participantName = `user-${Math.random().toString(36).slice(2, 8)}`;
 
+      // M8: Use voice ref instead of voice state dependency to prevent unintended loops
+      const currentVoice = selectedVoiceRef.current;
       const res = await fetch(
-        `${TOKEN_SERVER_URL}/token?room=${roomName}&identity=${participantName}&voice=${selectedVoice}`
+        `${TOKEN_SERVER_URL}/token?room=${targetRoom}&identity=${participantName}&voice=${currentVoice}`
       );
 
       if (!res.ok) {
-        throw new Error('Failed to get token');
+        throw new Error(`Failed to retrieve secure LiveKit token (HTTP status ${res.status})`);
       }
 
       const data = await res.json();
@@ -444,33 +587,32 @@ function App() {
     } finally {
       setIsConnecting(false);
     }
-  }, [selectedVoice]);
+  }, []);
 
-  const disconnect = useCallback((targetRoomName = null) => {
+  // H9: Clean separation of disconnect (hang up) and reconnect flow
+  const handleHangUp = useCallback(() => {
     setToken(null);
     setInitialLoading(false);
-    if (typeof targetRoomName === 'string') {
-      setInitialLoading(true);
-      setTimeout(() => {
-        connect(targetRoomName);
-      }, 500);
+  }, []);
+
+  const handleReconnect = useCallback((targetRoomName) => {
+    setToken(null);
+    setInitialLoading(true);
+    
+    // Clear any active reconnect timer
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
     }
+    
+    reconnectTimeoutRef.current = setTimeout(() => {
+      connect(targetRoomName, false);
+    }, 500);
   }, [connect]);
 
-  // Auto connect on component mount
+  // Auto connect on component mount (connect(null, true) is clear and non-overloaded - M7)
   useEffect(() => {
-    connect(true);
+    connect(null, true);
   }, [connect]);
-
-  // Format date helper
-  const formatDate = (dateStr) => {
-    try {
-      const d = new Date(dateStr);
-      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    } catch (e) {
-      return dateStr;
-    }
-  };
 
   if (token) {
     return (
@@ -483,15 +625,17 @@ function App() {
         connect={true}
         audio={true}
         video={false}
-        onDisconnected={disconnect}
+        onDisconnected={handleHangUp} // Explicitly passes zero-argument callback to prevent string-enum matching - H9
       >
         <RoomAudioRenderer />
         <div className="app">
-          <DashboardContent onDisconnect={disconnect} />
+          {/* Explicit callbacks to manage state robustly */}
+          <DashboardContent onHangUp={handleHangUp} onReconnect={handleReconnect} />
         </div>
       </LiveKitRoom>
     );
   }
+
   if (initialLoading) {
     return (
       <div className="app">
@@ -524,13 +668,14 @@ function App() {
 
           {/* Premium Glassmorphic Voice Selector Dropdown (Item 4) */}
           <div className="voice-select-wrapper" style={{ width: '100%', marginTop: '5px', marginBottom: '5px' }}>
-            <label style={{ fontSize: '0.65rem', textTransform: 'uppercase', letterSpacing: '2px', color: 'rgba(255,255,255,0.35)', display: 'block', marginBottom: '8px', textAlign: 'left', fontWeight: '600' }}>
+            <label id="voice-select-label" style={{ fontSize: '0.65rem', textTransform: 'uppercase', letterSpacing: '2px', color: 'rgba(255,255,255,0.35)', display: 'block', marginBottom: '8px', textAlign: 'left', fontWeight: '600' }}>
               Assistant Voice
             </label>
             <select
               value={selectedVoice}
               onChange={(e) => setSelectedVoice(e.target.value)}
               className="voice-select"
+              aria-labelledby="voice-select-label"
               style={{
                 width: '100%',
                 padding: '12px 16px',
@@ -562,8 +707,9 @@ function App() {
           <div style={{ display: 'flex', gap: '12px', marginTop: '5px', width: '100%', justifyContent: 'center' }}>
             <button
               className="btn-circle btn-accent"
-              onClick={connect}
+              onClick={() => connect(null, false)}
               disabled={isConnecting}
+              aria-label={isConnecting ? 'Establishing connection to assistant' : 'Connect to assistant'}
               style={{ width: 'auto', flex: 1, borderRadius: '50px', padding: '0 30px', display: 'flex', gap: '8px', fontSize: '0.9rem', height: '48px' }}
             >
               {isConnecting ? (
@@ -583,6 +729,7 @@ function App() {
             <button
               className="btn-circle"
               onClick={openHistory}
+              aria-label="View saved conversation sessions log"
               title="Saved Conversation History"
               style={{ background: 'rgba(255,255,255,0.05)', width: '48px', height: '48px' }}
             >
@@ -594,70 +741,99 @@ function App() {
         </div>
       </div>
 
-      {/* DISCONNECTED STATE HISTORY MODAL */}
+      {/* DISCONNECTED STATE HISTORY MODAL - H17: dialog role, focusable close button, & aria-modal added */}
       {showHistoryModal && (
         <div className="modal-overlay" onClick={closeHistory}>
-          <div className="modal-content glass-panel" onClick={(e) => e.stopPropagation()}>
+          <div className="modal-content glass-panel" role="dialog" aria-modal="true" aria-label="Saved Conversation Sessions" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <h3>
                 <History size={20} className="text-violet-400" />
                 <span>Saved Conversation Sessions</span>
               </h3>
-              <button className="close-modal-btn" onClick={closeHistory}>&times;</button>
+              <button className="close-modal-btn" aria-label="Close history modal" onClick={closeHistory}>&times;</button>
             </div>
             
             <div className="modal-body">
               {selectedPastConv ? (
                 /* Saved Messages view */
                 <div className="history-chat-view">
-                  <div style={{ display: 'flex', justifyItems: 'center', justifyContent: 'space-between', marginBottom: '15px' }}>
-                    <button className="back-btn" onClick={() => setSelectedPastConv(null)} style={{ margin: 0 }}>
+                  <div style={{ display: 'flex', justifyItems: 'center', justifyContent: 'space-between', padding: '15px', borderBottom: '1px solid var(--glass-border)', background: 'rgba(0,0,0,0.1)' }}>
+                    <button className="back-btn" onClick={() => setSelectedPastConv(null)} style={{ margin: 0, width: 'auto', background: 'transparent', border: 'none' }}>
                       <ArrowLeft size={16} />
                       <span>Back to Sessions</span>
                     </button>
                     <button 
                       className="btn-circle btn-accent" 
-                      onClick={() => { closeHistory(); connect(selectedPastConv); }}
+                      onClick={() => { closeHistory(); handleReconnect(selectedPastConv); }}
                       style={{ width: 'auto', borderRadius: '50px', padding: '0 20px', height: '36px', fontSize: '0.85rem', display: 'flex', gap: '6px', margin: 0 }}
                     >
                       <Play size={14} fill="white" />
                       <span>Continue Session</span>
                     </button>
                   </div>
-                  <div className="chat-scroll" style={{ maxHeight: '400px' }}>
-                    {pastMessages.length === 0 ? (
-                      <p className="no-msgs">No messages found in this session.</p>
-                    ) : (
-                      pastMessages.map((msg, idx) => {
-                        const isUser = msg.role === 'user';
-                        return (
-                          <div key={idx} className={`chat-bubble-wrapper ${isUser ? 'user' : 'agent'}`}>
-                            <div className="bubble">{msg.content}</div>
-                            <div className="bubble-meta">
-                              {isUser ? 'You' : 'Agent'}
+                  
+                  {isHistoryLoading ? (
+                    <div className="history-empty" style={{ height: '300px' }}>
+                      <RotateCw size={32} className="animate-spin text-violet-400" />
+                      <p>Loading session messages...</p>
+                    </div>
+                  ) : historyError ? (
+                    <div className="history-empty text-red-500" style={{ height: '300px' }}>
+                      <AlertCircle size={32} />
+                      <p>{historyError}</p>
+                    </div>
+                  ) : (
+                    <div className="chat-scroll" style={{ maxHeight: '400px' }}>
+                      {pastMessages.length === 0 ? (
+                        <p className="no-msgs">No messages found in this session.</p>
+                      ) : (
+                        pastMessages.map((msg, idx) => {
+                          const isUser = msg.role === 'user';
+                          return (
+                            <div key={`past-modal-${idx}`} className={`chat-bubble-wrapper ${isUser ? 'user' : 'agent'}`}>
+                              <div className="bubble">{msg.content}</div>
+                              <div className="bubble-meta">
+                                {isUser ? 'You' : 'Agent'}
+                              </div>
                             </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  )}
                 </div>
               ) : (
                 /* Session List view */
-                <div className="session-list" style={{ maxHeight: '400px', overflowY: 'auto' }}>
-                  {pastConversations.length === 0 ? (
+                <div className="session-list" style={{ maxHeight: '400px', overflowY: 'auto', padding: '24px' }}>
+                  {isHistoryLoading ? (
+                    <div className="history-empty">
+                      <RotateCw size={32} className="animate-spin text-violet-400" />
+                      <p>Loading saved sessions...</p>
+                    </div>
+                  ) : historyError ? (
+                    <div className="history-empty text-red-500">
+                      <AlertCircle size={32} />
+                      <p>{historyError}</p>
+                    </div>
+                  ) : pastConversations.length === 0 ? (
                     <div className="history-empty">
                       <p>No saved conversation logs found yet.</p>
                     </div>
                   ) : (
                     pastConversations.map((conv) => (
-                      <div key={conv.id} className="session-card" onClick={() => loadPastSession(conv.room_name)}>
+                      <button
+                        key={conv.id}
+                        className="session-card"
+                        onClick={() => loadPastSession(conv.room_name)}
+                        style={{ width: '100%', background: 'transparent', textAlign: 'left', border: '1px solid var(--glass-border)', display: 'block', marginBottom: '10px' }}
+                        aria-label={`View conversation from ${formatDateHelper(conv.created_at)}`}
+                      >
                         <div className="session-card-header">
                           <span className="session-title">{conv.title || `Session #${conv.id}`}</span>
                           <Calendar size={14} className="text-gray-500" />
                         </div>
-                        <span className="session-date">{formatDate(conv.created_at)}</span>
-                      </div>
+                        <span className="session-date">{formatDateHelper(conv.created_at)}</span>
+                      </button>
                     ))
                   )}
                 </div>
@@ -670,4 +846,11 @@ function App() {
   );
 }
 
-export default App;
+// Export App wrapped inside Error Boundary to prevent full application failures
+export default function AppWithErrorBoundary() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}

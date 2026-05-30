@@ -7,19 +7,47 @@ import uvicorn
 import asyncpg
 from typing import List, Optional
 
-app = FastAPI(title="LiveKit Token & History Server")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from contextlib import asynccontextmanager
 
 API_KEY = os.environ.get("LIVEKIT_API_KEY", "devkey")
 API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "devsecret")
 DB_URL = os.environ.get("POSTGRES_URL", "postgresql://postgres:postgrespassword@db:5432/voice_agent")
+TOKEN_SERVER_SECRET = os.environ.get("TOKEN_SERVER_SECRET")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Create DB connection pool on startup with retries since Postgres might take a moment to be ready
+    app.state.db_pool = None
+    logger_print = lambda msg: print(f"Token Server: {msg}")
+    for attempt in range(10):
+        try:
+            app.state.db_pool = await asyncpg.create_pool(DB_URL)
+            logger_print("Successfully connected to PostgreSQL database pool.")
+            break
+        except Exception as e:
+            logger_print(f"Failed to connect to PostgreSQL (attempt {attempt+1}/10): {e}")
+            import asyncio
+            await asyncio.sleep(2)
+            
+    yield
+    
+    if app.state.db_pool:
+        await app.state.db_pool.close()
+        logger_print("PostgreSQL connection pool closed.")
+
+app = FastAPI(title="LiveKit Token & History Server", lifespan=lifespan)
+
+# H13: Secure CORS configuration
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
+allow_all_origins = "*" in CORS_ORIGINS
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=not allow_all_origins,  # Must be False if using "*" wildcard
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class TokenResponse(BaseModel):
     token: str
@@ -35,31 +63,22 @@ class ConversationItem(BaseModel):
     title: Optional[str] = None
     created_at: str
 
-@app.on_event("startup")
-async def startup():
-    # Create DB connection pool on startup with retries since Postgres might take a moment to be ready
-    app.state.db_pool = None
-    for attempt in range(10):
-        try:
-            app.state.db_pool = await asyncpg.create_pool(DB_URL)
-            print("Token Server: Successfully connected to PostgreSQL database pool.")
-            break
-        except Exception as e:
-            print(f"Token Server: Failed to connect to PostgreSQL (attempt {attempt+1}/10): {e}")
-            import asyncio
-            await asyncio.sleep(2)
-
-@app.on_event("shutdown")
-async def shutdown():
-    if app.state.db_pool:
-        await app.state.db_pool.close()
+# H11: Auth check on /token endpoint if secret is configured
+from fastapi import Header
 
 @app.get("/token", response_model=TokenResponse)
 async def get_token(
     room: str = Query(default="default-room"),
     identity: str = Query(default="user"),
     voice: Optional[str] = Query(default=None),
+    secret: Optional[str] = Query(default=None),
+    x_secret: Optional[str] = Header(default=None, alias="X-Token-Server-Secret")
 ):
+    if TOKEN_SERVER_SECRET:
+        presented_secret = secret or x_secret
+        if presented_secret != TOKEN_SERVER_SECRET:
+            raise HTTPException(status_code=401, detail="Unauthorized: Invalid token server secret.")
+
     token = (
         AccessToken(api_key=API_KEY, api_secret=API_SECRET)
         .with_identity(identity)
@@ -99,7 +118,14 @@ async def get_messages(room_name: str):
             "SELECT role, content, created_at::text FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
             conv['id']
         )
-        return [dict(row) for row in rows]
+        # X7: Map legacy role 'agent' to 'assistant' to remain completely consistent
+        formatted_rows = []
+        for row in rows:
+            d = dict(row)
+            if d.get("role") == "agent":
+                d["role"] = "assistant"
+            formatted_rows.append(d)
+        return formatted_rows
 
 @app.get("/health")
 async def health():
