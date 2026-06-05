@@ -8,4 +8,5 @@ pydantic>=2.5.0
 livekit-api>=1.0.0
 asyncpg>=0.29.0
 tavily-python>=0.5.5
+aiohttp>=3.9.0
 

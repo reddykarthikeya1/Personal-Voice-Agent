@@ -3,6 +3,7 @@ import logging
 import asyncio
 import asyncpg
 import json
+import aiohttp
 
 from datetime import datetime, timezone
 
@@ -130,6 +131,143 @@ async def web_search(
     except Exception as e:
         logger.error("Error executing Tavily web search: %s", e, exc_info=True)
         return f"An error occurred while searching the web: {str(e)}"
+
+
+# Shared async HTTP helper for the keyless data tools below.
+async def _http_get_json(url: str, params: dict | None = None, timeout: float = 10.0):
+    timeout_cfg = aiohttp.ClientTimeout(total=timeout)
+    async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+        async with session.get(url, params=params) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
+# WMO weather interpretation codes -> short spoken descriptions
+_WEATHER_CODES = {
+    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "freezing fog",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    56: "freezing drizzle", 57: "heavy freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain",
+    66: "freezing rain", 67: "heavy freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light rain showers", 81: "rain showers", 82: "violent rain showers",
+    85: "light snow showers", 86: "snow showers",
+    95: "thunderstorms", 96: "thunderstorms with hail", 99: "severe thunderstorms with hail",
+}
+
+
+@function_tool
+async def get_weather(location: str) -> str:
+    """Get the current weather conditions for a city or place. Use this for any weather
+    question instead of a generic web search — it is faster and more accurate.
+
+    Args:
+        location: The city or place name, e.g. "Tokyo" or "Paris, France".
+    """
+    logger.info("Fetching weather for: '%s'", location)
+    try:
+        # 1) Geocode the place name to coordinates (keyless).
+        geo = await _http_get_json(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": location, "count": 1, "language": "en", "format": "json"},
+        )
+        matches = geo.get("results") or []
+        if not matches:
+            return f"I couldn't find a place called {location}. Could you say the city name again?"
+
+        place = matches[0]
+        lat, lon = place["latitude"], place["longitude"]
+        name = place.get("name", location)
+        country = place.get("country", "")
+        where = f"{name}, {country}" if country else name
+
+        # 2) Fetch current conditions for those coordinates (keyless).
+        wx = await _http_get_json(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                "temperature_unit": "celsius",
+                "wind_speed_unit": "kmh",
+            },
+        )
+        cur = wx.get("current", {})
+        temp_c = cur.get("temperature_2m")
+        feels_c = cur.get("apparent_temperature")
+        humidity = cur.get("relative_humidity_2m")
+        wind = cur.get("wind_speed_10m")
+        desc = _WEATHER_CODES.get(cur.get("weather_code"), "unclear conditions")
+
+        if temp_c is None:
+            return f"I found {where} but couldn't read the current weather. Try again in a moment."
+
+        temp_f = round(temp_c * 9 / 5 + 32)
+        result = (
+            f"In {where} it's currently {round(temp_c)} degrees Celsius "
+            f"({temp_f} Fahrenheit) with {desc}."
+        )
+        if feels_c is not None and abs(feels_c - temp_c) >= 2:
+            result += f" Feels like {round(feels_c)} Celsius."
+        if humidity is not None:
+            result += f" Humidity {round(humidity)} percent."
+        if wind is not None:
+            result += f" Wind {round(wind)} kilometers per hour."
+
+        logger.info("Weather result: %s", result)
+        return result
+    except Exception as e:
+        logger.error("Error fetching weather: %s", e, exc_info=True)
+        return f"Sorry, I couldn't get the weather right now: {str(e)}"
+
+
+@function_tool
+async def get_crypto_price(coin: str) -> str:
+    """Get the current US-dollar price of a cryptocurrency and its 24-hour change.
+    Use this for crypto price questions instead of a web search.
+
+    Args:
+        coin: The cryptocurrency name or symbol, e.g. "Bitcoin", "BTC", or "Ethereum".
+    """
+    logger.info("Fetching crypto price for: '%s'", coin)
+    try:
+        # 1) Resolve the name/symbol to a CoinGecko coin id (keyless).
+        search = await _http_get_json(
+            "https://api.coingecko.com/api/v3/search",
+            params={"query": coin},
+        )
+        coins = search.get("coins") or []
+        if not coins:
+            return f"I couldn't find a cryptocurrency called {coin}."
+
+        top = coins[0]
+        coin_id = top["id"]
+        name = top.get("name", coin)
+        symbol = (top.get("symbol") or "").upper()
+
+        # 2) Fetch the current price and 24h change (keyless).
+        price_data = await _http_get_json(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": coin_id, "vs_currencies": "usd", "include_24hr_change": "true"},
+        )
+        entry = price_data.get(coin_id)
+        if not entry or entry.get("usd") is None:
+            return f"I couldn't get a current price for {name} right now."
+
+        price = entry["usd"]
+        change = entry.get("usd_24h_change")
+        price_str = f"{price:,.2f}" if price < 100 else f"{price:,.0f}"
+        result = f"{name} ({symbol}) is trading at about {price_str} US dollars."
+        if change is not None:
+            direction = "up" if change >= 0 else "down"
+            result += f" That's {direction} {abs(change):.1f} percent in the last 24 hours."
+
+        logger.info("Crypto result: %s", result)
+        return result
+    except Exception as e:
+        logger.error("Error fetching crypto price: %s", e, exc_info=True)
+        return f"Sorry, I couldn't get that crypto price right now: {str(e)}"
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -281,10 +419,14 @@ HOW YOU TALK — your replies are read aloud, so speak, don't write a document:
 - Use plain, easy-to-pronounce words. Speak symbols out ("percent", "dollars", "and").
 - When there's more to say, give the short version and offer to go deeper, e.g. "want the details?".
 
-STAYING CURRENT — your built-in knowledge is out of date:
-- For anything that can change — news, prices, weather, sports, recent events, or any "latest", "today", or "right now" question, and facts about specific people, products, or companies — use the web_search tool before answering.
+YOUR TOOLS — prefer the specific tool over a generic search:
+- get_weather: current conditions for any city. Use it for any weather question.
+- get_crypto_price: live US-dollar price and 24-hour change for a cryptocurrency.
+- web_search: anything else that can change — news, recent events, sports, or facts about specific people, products, or companies, and any "latest", "today", or "right now" question.
+
+USING THE WEB:
 - Write search queries in natural, present-tense terms. Do NOT put a year in the query unless the user asked about a specific past year; if you need the year, it is {current_year}.
-- Base time-sensitive answers on what the search returns, not on memory. If results look stale or conflict with today's date, search again with a better query rather than repeating old information.
+- Base time-sensitive answers on what the tool returns, not on memory. If results look stale or conflict with today's date, search again with a better query rather than repeating old information.
 
 CONVERSATION STYLE:
 - Never reply with empty filler like "Sure!" or "Okay!" on its own. Either answer, begin the task, or ask one quick clarifying question if the request is genuinely unclear.
@@ -297,7 +439,7 @@ CONVERSATION STYLE:
         llm=llm_instance,
         tts=tts_instance,
         chat_ctx=chat_ctx,
-        tools=[web_search],
+        tools=[web_search, get_weather, get_crypto_price],
         # Edge-TTS / Kokoro do not return word-aligned transcripts, so leaving this on
         # logged a warning on every turn AND left the agent transcript empty — which made
         # the UI's "Speaking" status fall back to "Synthesizing voice...". Disabling it lets
