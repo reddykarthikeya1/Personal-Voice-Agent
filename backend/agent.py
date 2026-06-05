@@ -238,12 +238,11 @@ async def entrypoint(ctx: JobContext) -> None:
         role = 'assistant' if msg['role'] == 'agent' else msg['role']
         chat_ctx.add_message(role=role, content=msg['content'])
 
-    # Determine greeting and add it to chat context before initializing Agent
+    # Determine greeting to be spoken on startup
     if past_messages:
         greeting = "Welcome back! I remember our previous conversation. What would you like to talk about?"
     else:
         greeting = "Hi there! I'm Kay, your personal voice assistant. How can I help you today?"
-    chat_ctx.add_message(role="assistant", content=greeting)
 
     # H15: Create agent with modern TurnHandlingOptions
     interruption_mode = os.getenv("INTERRUPTION_MODE", "adaptive").lower()
@@ -351,14 +350,13 @@ async def entrypoint(ctx: JobContext) -> None:
                         try:
                             logger.info("Triggering auto-title generation for session outside connection pool lock.")
                             summary_ctx = llm.ChatContext()
-                            for msg in db_msgs:
-                                msg_role = 'assistant' if msg['role'] == 'agent' else msg['role']
-                                summary_ctx.add_message(role=msg_role, content=msg['content'])
-                            
                             summary_ctx.add_message(
                                 role="system",
                                 content="Create a short, creative 3-to-4 word summary title for this conversation based on the history above. Do not include quotes, markdown, or any introductory text. Reply with ONLY the title."
                             )
+                            for msg in db_msgs:
+                                msg_role = 'assistant' if msg['role'] == 'agent' else msg['role']
+                                summary_ctx.add_message(role=msg_role, content=msg['content'])
                             
                             async with llm_instance.chat(chat_ctx=summary_ctx) as stream:
                                 full_response = await stream.collect()
