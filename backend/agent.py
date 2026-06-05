@@ -274,159 +274,103 @@ async def entrypoint(ctx: JobContext) -> None:
     # M4: Boolean flag on entrypoint scope to ensure auto-title runs exactly once
     title_generated = False
 
-    async def _on_agent_state(event) -> None:
-        nonlocal title_generated
-        logger.info("--- AGENT STATE CHANGED: %s -> %s", event.old_state, event.new_state)
-        
-        # When agent finishes speaking (transition from speaking to listening/thinking)
-        # We capture the full generated assistant response here to avoid truncation
-        if event.old_state == "speaking" and event.new_state != "speaking":
-            logger.info("Chat context messages: %s", [f"{m.role}: {m.text_content[:30] if m.text_content else None}" for m in agent.chat_ctx.messages()])
-            assistant_msg = None
-            # M16: Access messages via chat_ctx instead of legacy session.history
-            for msg in reversed(agent.chat_ctx.messages()):
-                if msg.role == "assistant":
-                    assistant_msg = msg
-                    break
-            
-            if assistant_msg and db_conv_id:
-                # M3 & X12: Use standard text_content with None string safety guard
-                content_str = (assistant_msg.text_content or "").strip()
-                if content_str:
-                    logger.info("Agent finished speaking, saving response: '%s...'", content_str[:50])
-                    
-                    # N1: Broadcast first to ensure frontend stays active even if DB is blocked/down
-                    try:
-                        payload = json.dumps({"sender": "agent", "text": content_str})
-                        await ctx.room.local_participant.send_text(payload, topic='lk.chat')
-                        logger.info("Published agent chat message: %s", payload)
-                    except Exception as ex:
-                        logger.error("Error publishing agent chat message: %s", ex)
-
-                    # M15 & M1: Await saving sequentially in the event handler to preserve order
-                    run_title_generation = False
-                    db_msgs = []
-                    if pool:
-                        try:
-                            # C2 & H1: Acquire connection from shared pool
-                            async with pool.acquire() as c:
-                                # C4: Insert as 'assistant' to prevent pydantic validation errors
-                                await c.execute(
-                                    "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3)",
-                                    db_conv_id, 'assistant', content_str
-                                )
-                                logger.info("Saved agent message to DB: '%s...'", content_str[:30])
-                                
-                                # Check auto-naming title
-                                try:
-                                    count_row = await c.fetchrow(
-                                        "SELECT COUNT(*) FROM messages WHERE conversation_id = $1 AND role = 'user'",
-                                        db_conv_id
-                                    )
-                                    user_prompt_count = count_row[0]
-
-                                    title_row = await c.fetchrow(
-                                        "SELECT title FROM conversations WHERE id = $1",
-                                        db_conv_id
-                                    )
-                                    has_custom_title = title_row['title'] is not None if title_row else False
-
-                                    # X8: Prepare for auto-title generation if needed but release connection first
-                                    if user_prompt_count >= 3 and not has_custom_title and not title_generated:
-                                        title_generated = True
-                                        run_title_generation = True
-                                        rows = await c.fetch(
-                                            "SELECT role, content FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
-                                            db_conv_id
-                                        )
-                                        db_msgs = [dict(r) for r in rows]
-                                except Exception as title_err:
-                                    logger.error("Error checking title requirements: %s", title_err)
-                        except Exception as ex:
-                            logger.error("Error saving agent message to DB: %s", ex)
-
-                    # X8: Make LLM auto-title round-trip outside of connection acquisition block to prevent pool exhaustion
-                    if run_title_generation and db_msgs:
-                        try:
-                            logger.info("Triggering auto-title generation for session outside connection pool lock.")
-                            summary_ctx = llm.ChatContext()
-                            summary_ctx.add_message(
-                                role="system",
-                                content="Create a short, creative 3-to-4 word summary title for this conversation based on the history above. Do not include quotes, markdown, or any introductory text. Reply with ONLY the title."
-                            )
-                            for msg in db_msgs:
-                                msg_role = 'assistant' if msg['role'] == 'agent' else msg['role']
-                                summary_ctx.add_message(role=msg_role, content=msg['content'])
-                            
-                            async with llm_instance.chat(chat_ctx=summary_ctx) as stream:
-                                full_response = await stream.collect()
-                                new_title = full_response.choices[0].message.content.strip()
-                                new_title = new_title.replace('"', '').replace("'", "")
-                                
-                            # Re-acquire connection just for the quick update statement
-                            if pool:
-                                try:
-                                    async with pool.acquire() as c:
-                                        await c.execute(
-                                            "UPDATE conversations SET title = $1 WHERE id = $2",
-                                            new_title, db_conv_id
-                                        )
-                                        logger.info("Successfully generated and saved conversation title: '%s'", new_title)
-                                except Exception as update_err:
-                                    # N4: Keep title_generated=True to prevent looping LLM calls on DB update fail
-                                    logger.error("Failed to save generated conversation title to DB: %s", update_err)
-                        except Exception as title_err:
-                            # N4: Keep title_generated=True to prevent looping LLM calls on LLM generation fail
-                            logger.error("Error auto-generating conversation title: %s", title_err)
-
     @session.on("agent_state_changed")
     def on_agent_state(event) -> None:
-        run_background_task(_on_agent_state(event), name="on_agent_state")
+        logger.info("--- AGENT STATE CHANGED: %s -> %s", event.old_state, event.new_state)
 
     async def _on_conversation_item(event) -> None:
+        nonlocal title_generated
         item = event.item
         
-        # Save and publish ONLY user messages here immediately
-        # Agent messages are handled at completed speech in on_agent_state to prevent truncation
-        if hasattr(item, 'role') and item.role == 'user' and hasattr(item, 'content') and item.content and db_conv_id:
-            # N5: Safely serialize content to a single string (skip raw bytes like AudioContent.content)
-            content_str = ""
-            if isinstance(item.content, list):
-                content_parts = []
-                for part in item.content:
-                    if hasattr(part, 'text') and part.text:
-                        content_parts.append(part.text)
-                    elif isinstance(part, str):
-                        content_parts.append(part)
-                content_str = "".join(content_parts)
-            elif isinstance(item.content, str):
-                content_str = item.content
-            elif hasattr(item.content, 'text') and item.content.text:
-                content_str = item.content.text
-
-            content_str = content_str.strip()
+        # Save and publish user and assistant ChatMessage items when they are committed to context
+        if isinstance(item, llm.ChatMessage) and item.content and db_conv_id:
+            # Safely serialize content to a single string (skip raw bytes like AudioContent.content)
+            content_str = (item.text_content or "").strip()
             if not content_str:
                 return
             
-            # N1: Decoupled user message broadcasting to keep UI active if DB is down (broadcast first)
+            # Map role: 'assistant' to 'assistant', and anything else to 'user'
+            role = 'assistant' if item.role in ('assistant', 'agent') else 'user'
+            
+            # N1: Decoupled message broadcasting to keep UI active (broadcast first)
             try:
-                payload = json.dumps({"sender": "user", "text": content_str})
+                payload = json.dumps({"sender": role, "text": content_str})
                 await ctx.room.local_participant.send_text(payload, topic='lk.chat')
-                logger.info("Published user chat message: %s", payload)
+                logger.info("Published %s chat message: %s", role, payload)
             except Exception as ex:
-                logger.error("Error publishing user chat message: %s", ex)
+                logger.error("Error publishing %s chat message: %s", role, ex)
 
             # M15 & M1: Await database save in event handler to preserve order
+            run_title_generation = False
+            db_msgs = []
             if pool:
                 try:
                     async with pool.acquire() as c:
                         await c.execute(
                             "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3)",
-                            db_conv_id, 'user', content_str
+                            db_conv_id, role, content_str
                         )
-                        logger.info("Saved user message to DB: user: '%s...'", content_str[:30])
+                        logger.info("Saved %s message to DB: '%s...'", role, content_str[:30])
+                        
+                        # Check auto-naming title if it is a user message
+                        if role == 'user':
+                            try:
+                                count_row = await c.fetchrow(
+                                    "SELECT COUNT(*) FROM messages WHERE conversation_id = $1 AND role = 'user'",
+                                    db_conv_id
+                                )
+                                user_prompt_count = count_row[0]
+
+                                title_row = await c.fetchrow(
+                                    "SELECT title FROM conversations WHERE id = $1",
+                                    db_conv_id
+                                )
+                                has_custom_title = title_row['title'] is not None if title_row else False
+
+                                if user_prompt_count >= 3 and not has_custom_title and not title_generated:
+                                    title_generated = True
+                                    run_title_generation = True
+                                    rows = await c.fetch(
+                                        "SELECT role, content FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+                                        db_conv_id
+                                    )
+                                    db_msgs = [dict(r) for r in rows]
+                            except Exception as title_err:
+                                logger.error("Error checking title requirements: %s", title_err)
                 except Exception as ex:
-                    logger.error("Error saving user message to DB: %s", ex)
+                    logger.error("Error saving %s message to DB: %s", role, ex)
+
+            # X8: Make LLM auto-title round-trip outside of connection acquisition block to prevent pool exhaustion
+            if run_title_generation and db_msgs:
+                try:
+                    logger.info("Triggering auto-title generation for session outside connection pool lock.")
+                    summary_ctx = llm.ChatContext()
+                    summary_ctx.add_message(
+                        role="system",
+                        content="Create a short, creative 3-to-4 word summary title for this conversation based on the history above. Do not include quotes, markdown, or any introductory text. Reply with ONLY the title."
+                    )
+                    for msg in db_msgs:
+                        msg_role = 'assistant' if msg['role'] == 'agent' else msg['role']
+                        summary_ctx.add_message(role=msg_role, content=msg['content'])
+                    
+                    async with llm_instance.chat(chat_ctx=summary_ctx) as stream:
+                        full_response = await stream.collect()
+                        new_title = full_response.text.strip()
+                        new_title = new_title.replace('"', '').replace("'", "")
+                        
+                    # Re-acquire connection just for the quick update statement
+                    if pool:
+                        try:
+                            async with pool.acquire() as c:
+                                await c.execute(
+                                    "UPDATE conversations SET title = $1 WHERE id = $2",
+                                    new_title, db_conv_id
+                                )
+                                logger.info("Successfully generated and saved conversation title: '%s'", new_title)
+                        except Exception as update_err:
+                            logger.error("Failed to save generated conversation title to DB: %s", update_err)
+                except Exception as title_err:
+                    logger.error("Error auto-generating conversation title: %s", title_err)
 
     @session.on("conversation_item_added")
     def on_conversation_item(event) -> None:
