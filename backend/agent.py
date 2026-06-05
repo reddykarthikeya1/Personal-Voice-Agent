@@ -3,6 +3,9 @@ import logging
 import asyncio
 import asyncpg
 import json
+import csv
+import io
+import re
 import aiohttp
 
 from datetime import datetime, timezone
@@ -270,6 +273,114 @@ async def get_crypto_price(coin: str) -> str:
         return f"Sorry, I couldn't get that crypto price right now: {str(e)}"
 
 
+# Google Sheet holding workout plans — one tab per person (the user + friends).
+# Read-only via the public CSV export; shared "anyone with link can view". Overridable via env.
+WORKOUT_SHEET_ID = os.getenv("WORKOUT_SHEET_ID", "1_MTl-ZH4k9S2dUiI5gbXH-m826jEoUKZ1GQQmqBltZU")
+
+
+async def _discover_sheet_tabs(sheet_id: str):
+    """Return [(tab_name, gid), ...] for every tab in the spreadsheet, parsed keylessly
+    from the htmlview bootstrap. Falls back to the default first tab on any failure."""
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/htmlview"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10.0)) as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+    tabs = []
+    for block in re.findall(r"items\.push\((\{.*?\})\)", html):
+        name_m = re.search(r'name:\s*"(.*?)"', block)
+        gid_m = re.search(r'gid:\s*"(\d+)"', block)
+        if name_m and gid_m:
+            tabs.append((name_m.group(1), gid_m.group(1)))
+    return tabs or [("Sheet1", "0")]
+
+
+async def _fetch_tab_rows(sheet_id: str, gid: str):
+    """Fetch one tab as parsed CSV rows."""
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid}"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10.0)) as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+    return list(csv.reader(io.StringIO(text)))
+
+
+@function_tool
+async def get_workout_plan(person: str = "", day: str = "", body_part: str = "") -> str:
+    """Look up workout plans from the user's Google Sheet. The sheet has one tab per person —
+    the user and their friends — so this can compare people's training and lifts. Use it for
+    any question about workouts, exercises, sets, reps, weights, or who is strongest at something.
+
+    Args:
+        person: Optional. A person's name to limit to (e.g. "Karthikeya"). Empty = everyone.
+        day: Optional. A training day to filter to, e.g. "Day 1".
+        body_part: Optional. A muscle-group keyword to filter exercises, e.g. "chest" or "back".
+    """
+    logger.info("Reading workout plan (person='%s', day='%s', body_part='%s')",
+                person or "<all>", day or "<all>", body_part or "<all>")
+    try:
+        tabs = await _discover_sheet_tabs(WORKOUT_SHEET_ID)
+
+        # Select which people's tabs to read.
+        if person:
+            needle = person.strip().lower()
+            selected = [(n, g) for (n, g) in tabs if needle in n.lower()]
+            if not selected:
+                names = ", ".join(n for n, _ in tabs)
+                return f"I couldn't find anyone called '{person}'. The people in the sheet are: {names}."
+        else:
+            selected = tabs
+
+        day_needle = day.strip().lower() if day else ""
+        bp_needle = body_part.strip().lower() if body_part else ""
+
+        sections = []
+        for name, gid in selected:
+            try:
+                rows = await _fetch_tab_rows(WORKOUT_SHEET_ID, gid)
+            except Exception as tab_err:
+                logger.warning("Could not read tab '%s' (gid %s): %s", name, gid, tab_err)
+                continue
+            if not rows or len(rows) < 2:
+                continue
+
+            header = [h.strip() for h in rows[0]]
+            lines = []
+            for r in rows[1:]:
+                cells = [c.strip() for c in r]
+                if not any(cells):
+                    continue
+                if day_needle and not (cells and day_needle in cells[0].lower()):
+                    continue
+                if bp_needle and bp_needle not in " ".join(cells).lower():
+                    continue
+                pairs = [
+                    f"{header[i]}: {cells[i]}"
+                    for i in range(min(len(header), len(cells)))
+                    if cells[i]
+                ]
+                if pairs:
+                    lines.append(", ".join(pairs))
+            if lines:
+                sections.append(f"=== {name} ===\n" + "\n".join(lines))
+
+        if not sections:
+            filt = body_part or day or "that"
+            return f"I couldn't find any '{filt}' entries in the workout sheet."
+
+        people_count = len(sections)
+        result = (
+            f"Workout plans from the user's Google Sheet ({people_count} "
+            f"{'person' if people_count == 1 else 'people'}). "
+            f"Weights are the proof for strength comparisons.\n\n" + "\n\n".join(sections)
+        )
+        logger.info("Workout plan: returned %d section(s)", people_count)
+        return result
+    except Exception as e:
+        logger.error("Error reading workout sheet: %s", e, exc_info=True)
+        return f"Sorry, I couldn't read the workout sheet right now: {str(e)}"
+
+
 async def entrypoint(ctx: JobContext) -> None:
     logger.info("Agent joining room: %s", ctx.room.name)
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -422,6 +533,7 @@ HOW YOU TALK — your replies are read aloud, so speak, don't write a document:
 YOUR TOOLS — prefer the specific tool over a generic search:
 - get_weather: current conditions for any city. Use it for any weather question.
 - get_crypto_price: live US-dollar price and 24-hour change for a cryptocurrency.
+- get_workout_plan: workout routines from the user's Google Sheet, which has one tab per person (the user and their friends). Use it for any question about workouts, training, lifts, or comparing people — e.g. who is strongest at a lift. Cite the weights from the sheet as your proof, and only name people and numbers that actually appear in the data.
 - web_search: anything else that can change — news, recent events, sports, or facts about specific people, products, or companies, and any "latest", "today", or "right now" question.
 
 USING THE WEB:
@@ -439,7 +551,7 @@ CONVERSATION STYLE:
         llm=llm_instance,
         tts=tts_instance,
         chat_ctx=chat_ctx,
-        tools=[web_search, get_weather, get_crypto_price],
+        tools=[web_search, get_weather, get_crypto_price, get_workout_plan],
         # Edge-TTS / Kokoro do not return word-aligned transcripts, so leaving this on
         # logged a warning on every turn AND left the agent transcript empty — which made
         # the UI's "Speaking" status fall back to "Synthesizing voice...". Disabling it lets
