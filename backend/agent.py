@@ -268,8 +268,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # M4: Boolean flag on entrypoint scope to ensure auto-title runs exactly once
     title_generated = False
 
-    @session.on("agent_state_changed")
-    async def on_agent_state(event) -> None:
+    async def _on_agent_state(event) -> None:
         nonlocal title_generated
         logger.info("--- AGENT STATE CHANGED: %s -> %s", event.old_state, event.new_state)
         
@@ -374,8 +373,11 @@ async def entrypoint(ctx: JobContext) -> None:
                             # N4: Keep title_generated=True to prevent looping LLM calls on LLM generation fail
                             logger.error("Error auto-generating conversation title: %s", title_err)
 
-    @session.on("conversation_item_added")
-    async def on_conversation_item(event) -> None:
+    @session.on("agent_state_changed")
+    def on_agent_state(event) -> None:
+        run_background_task(_on_agent_state(event), name="on_agent_state")
+
+    async def _on_conversation_item(event) -> None:
         item = event.item
         
         # Save and publish ONLY user messages here immediately
@@ -420,9 +422,13 @@ async def entrypoint(ctx: JobContext) -> None:
                 except Exception as ex:
                     logger.error("Error saving user message to DB: %s", ex)
 
+    @session.on("conversation_item_added")
+    def on_conversation_item(event) -> None:
+        run_background_task(_on_conversation_item(event), name="on_conversation_item")
+
     # X3: Change deprecated "error" event to "close"
     @session.on("close")
-    async def on_session_close(event) -> None:
+    def on_session_close(event) -> None:
         logger.info("--- SESSION CLOSED: reason=%s, error=%s", getattr(event, 'reason', None), getattr(event, 'error', None))
 
     await session.start(
