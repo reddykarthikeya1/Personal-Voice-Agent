@@ -16,8 +16,10 @@ from livekit.agents import (
     cli,
     llm,
     TurnHandlingOptions,
+    function_tool,
 )
 from livekit.plugins import openai, silero
+from tavily import AsyncTavilyClient
 
 load_dotenv()
 
@@ -75,6 +77,44 @@ def run_background_task(coro, name=None):
 
 def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load()
+
+
+@function_tool
+async def web_search(
+    query: str,
+) -> str:
+    """Search the web for current information, news, facts, or weather.
+    
+    Args:
+        query: The search query to look up on the web.
+    """
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        logger.error("TAVILY_API_KEY is not set.")
+        return "Search failed: TAVILY_API_KEY is not set."
+        
+    logger.info("Executing Tavily web search for query: '%s'", query)
+    try:
+        client = AsyncTavilyClient(api_key=api_key)
+        response = await client.search(query=query, max_results=3, search_depth="basic")
+        
+        results = response.get("results", [])
+        if not results:
+            logger.info("No search results returned for query: '%s'", query)
+            return "No results found."
+            
+        summaries = []
+        for r in results:
+            title = r.get("title", "No Title")
+            content = r.get("content", "")
+            summaries.append(f"Title: {title}\nContent: {content[:200]}")
+            
+        formatted_result = "\n\n".join(summaries)
+        logger.info("Search successfully completed. Summarized results: %s...", formatted_result[:100])
+        return formatted_result
+    except Exception as e:
+        logger.error("Error executing Tavily web search: %s", e, exc_info=True)
+        return f"An error occurred while searching the web: {str(e)}"
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -201,12 +241,13 @@ async def entrypoint(ctx: JobContext) -> None:
     # H15: Create agent with modern TurnHandlingOptions
     interruption_mode = os.getenv("INTERRUPTION_MODE", "adaptive").lower()
     agent = Agent(
-        instructions="You are Kay, a helpful voice assistant. Always write your name as 'Kay' (with only 'K' capitalized) and never in all caps 'KAY' so that the text-to-speech engine pronounces it correctly as a word instead of spelling it out letter-by-letter. Keep responses concise and conversational.",
+        instructions="You are Kay, a helpful voice assistant. Always write your name as 'Kay' (with only 'K' capitalized) and never in all caps 'KAY' so that the text-to-speech engine pronounces it correctly as a word instead of spelling it out letter-by-letter. Keep responses concise and conversational. You have access to a web search tool to search the web for current information, news, facts, or weather when asked or when you need up-to-date knowledge.",
         vad=ctx.proc.userdata["vad"],
         stt=stt_instance,
         llm=llm_instance,
         tts=tts_instance,
         chat_ctx=chat_ctx,
+        tools=[web_search],
         use_tts_aligned_transcript=True,
         turn_handling=TurnHandlingOptions(
             turn_detection="vad",
