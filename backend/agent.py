@@ -4,6 +4,8 @@ import asyncio
 import asyncpg
 import json
 
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
@@ -83,8 +85,14 @@ def prewarm(proc: JobProcess) -> None:
 async def web_search(
     query: str,
 ) -> str:
-    """Search the web for current information, news, facts, or weather.
-    
+    """Search the web for current, up-to-date information: news, recent events, prices,
+    weather, sports, or facts about specific people, products, or companies.
+
+    Phrase the query in natural, present-tense terms describing what you want to know.
+    Do NOT add a year to the query unless the user explicitly asked about a specific past
+    year — adding an old year forces stale results. Base your answer on what this tool
+    returns, not on prior memory.
+
     Args:
         query: The search query to look up on the web.
     """
@@ -92,23 +100,30 @@ async def web_search(
     if not api_key:
         logger.error("TAVILY_API_KEY is not set.")
         return "Search failed: TAVILY_API_KEY is not set."
-        
+
     logger.info("Executing Tavily web search for query: '%s'", query)
     try:
         client = AsyncTavilyClient(api_key=api_key)
-        response = await client.search(query=query, max_results=3, search_depth="basic")
-        
+        response = await client.search(query=query, max_results=5, search_depth="basic")
+
         results = response.get("results", [])
         if not results:
             logger.info("No search results returned for query: '%s'", query)
-            return "No results found."
-            
-        summaries = []
+            return "No results found. Try rephrasing the query in simpler, present-tense terms."
+
+        # Re-anchor the model to the real current date so it doesn't fall back to its
+        # training-era default year when summarizing the results.
+        today = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
+        summaries = [f"(Today's date is {today}. Use only the information below; it is current.)"]
         for r in results:
             title = r.get("title", "No Title")
             content = r.get("content", "")
-            summaries.append(f"Title: {title}\nContent: {content[:200]}")
-            
+            published = r.get("published_date") or ""
+            line = f"Title: {title}\nContent: {content[:300]}"
+            if published:
+                line += f"\nPublished: {published}"
+            summaries.append(line)
+
         formatted_result = "\n\n".join(summaries)
         logger.info("Search successfully completed. Summarized results: %s...", formatted_result[:100])
         return formatted_result
@@ -246,15 +261,48 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # H15: Create agent with modern TurnHandlingOptions
     interruption_mode = os.getenv("INTERRUPTION_MODE", "adaptive").lower()
+
+    # Anchor the model to the real current date. Without this it falls back to its
+    # training-era default year (e.g. answering 2026 questions with 2023 facts).
+    now = datetime.now(timezone.utc)
+    current_date = now.strftime("%A, %B %d, %Y")
+    current_year = now.strftime("%Y")
+
+    instructions = f"""Today's date is {current_date}. Treat this as the present — never assume it is an earlier year.
+
+You are Kay, a warm and helpful voice assistant having a spoken, real-time conversation.
+
+YOUR NAME
+- Always write your name as "Kay" (only the K capitalized), never "KAY", so the text-to-speech engine pronounces it as a word instead of spelling it out.
+
+HOW YOU TALK — your replies are read aloud, so speak, don't write a document:
+- Keep replies short: usually one to three sentences. Lead with the answer first.
+- Never use markdown, numbered lists, bullet points, headings, asterisks, emoji, or code blocks — they sound broken when spoken. If you must list a few things, say them in a flowing sentence ("first..., then..., and finally...").
+- Use plain, easy-to-pronounce words. Speak symbols out ("percent", "dollars", "and").
+- When there's more to say, give the short version and offer to go deeper, e.g. "want the details?".
+
+STAYING CURRENT — your built-in knowledge is out of date:
+- For anything that can change — news, prices, weather, sports, recent events, or any "latest", "today", or "right now" question, and facts about specific people, products, or companies — use the web_search tool before answering.
+- Write search queries in natural, present-tense terms. Do NOT put a year in the query unless the user asked about a specific past year; if you need the year, it is {current_year}.
+- Base time-sensitive answers on what the search returns, not on memory. If results look stale or conflict with today's date, search again with a better query rather than repeating old information.
+
+CONVERSATION STYLE:
+- Never reply with empty filler like "Sure!" or "Okay!" on its own. Either answer, begin the task, or ask one quick clarifying question if the request is genuinely unclear.
+- Be direct and friendly. Don't over-apologize or pile on praise — a brief "good catch" is enough, then move on."""
+
     agent = Agent(
-        instructions="You are Kay, a helpful voice assistant. Always write your name as 'Kay' (with only 'K' capitalized) and never in all caps 'KAY' so that the text-to-speech engine pronounces it correctly as a word instead of spelling it out letter-by-letter. Keep responses concise and conversational. You have access to a web search tool to search the web for current information, news, facts, or weather when asked or when you need up-to-date knowledge.",
+        instructions=instructions,
         vad=ctx.proc.userdata["vad"],
         stt=stt_instance,
         llm=llm_instance,
         tts=tts_instance,
         chat_ctx=chat_ctx,
         tools=[web_search],
-        use_tts_aligned_transcript=True,
+        # Edge-TTS / Kokoro do not return word-aligned transcripts, so leaving this on
+        # logged a warning on every turn AND left the agent transcript empty — which made
+        # the UI's "Speaking" status fall back to "Synthesizing voice...". Disabling it lets
+        # LiveKit forward the LLM text as the transcript, populating the live status correctly.
+        use_tts_aligned_transcript=False,
         turn_handling=TurnHandlingOptions(
             turn_detection="vad",
             endpointing={
@@ -283,16 +331,16 @@ async def entrypoint(ctx: JobContext) -> None:
         item = event.item
         
         # Save and publish user and assistant ChatMessage items when they are committed to context
-        if isinstance(item, llm.ChatMessage) and item.content and db_conv_id:
+        if isinstance(item, llm.ChatMessage) and item.content:
             # Safely serialize content to a single string (skip raw bytes like AudioContent.content)
             content_str = (item.text_content or "").strip()
             if not content_str:
                 return
-            
+
             # Map role: 'assistant' to 'assistant', and anything else to 'user'
             role = 'assistant' if item.role in ('assistant', 'agent') else 'user'
-            
-            # N1: Decoupled message broadcasting to keep UI active (broadcast first)
+
+            # N1: Decoupled message broadcasting to keep UI active even if the DB is down
             try:
                 payload = json.dumps({"sender": role, "text": content_str})
                 await ctx.room.local_participant.send_text(payload, topic='lk.chat')
@@ -300,10 +348,12 @@ async def entrypoint(ctx: JobContext) -> None:
             except Exception as ex:
                 logger.error("Error publishing %s chat message: %s", role, ex)
 
-            # M15 & M1: Await database save in event handler to preserve order
+            # M15 & M1: Await database save in event handler to preserve order.
+            # Persistence only runs when the pool AND conversation row exist; the
+            # broadcast above is independent so the live transcript never blocks on the DB.
             run_title_generation = False
             db_msgs = []
-            if pool:
+            if pool and db_conv_id:
                 try:
                     async with pool.acquire() as c:
                         await c.execute(
