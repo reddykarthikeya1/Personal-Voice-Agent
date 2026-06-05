@@ -238,6 +238,13 @@ async def entrypoint(ctx: JobContext) -> None:
         role = 'assistant' if msg['role'] == 'agent' else msg['role']
         chat_ctx.add_message(role=role, content=msg['content'])
 
+    # Determine greeting and add it to chat context before initializing Agent
+    if past_messages:
+        greeting = "Welcome back! I remember our previous conversation. What would you like to talk about?"
+    else:
+        greeting = "Hi there! I'm Kay, your personal voice assistant. How can I help you today?"
+    chat_ctx.add_message(role="assistant", content=greeting)
+
     # H15: Create agent with modern TurnHandlingOptions
     interruption_mode = os.getenv("INTERRUPTION_MODE", "adaptive").lower()
     agent = Agent(
@@ -275,9 +282,10 @@ async def entrypoint(ctx: JobContext) -> None:
         # When agent finishes speaking (transition from speaking to listening/thinking)
         # We capture the full generated assistant response here to avoid truncation
         if event.old_state == "speaking" and event.new_state != "speaking":
+            logger.info("Chat context messages: %s", [f"{m.role}: {m.text_content[:30] if m.text_content else None}" for m in agent.chat_ctx.messages()])
             assistant_msg = None
             # M16: Access messages via chat_ctx instead of legacy session.history
-            for msg in reversed(chat_ctx.messages):
+            for msg in reversed(agent.chat_ctx.messages()):
                 if msg.role == "assistant":
                     assistant_msg = msg
                     break
@@ -440,14 +448,6 @@ async def entrypoint(ctx: JobContext) -> None:
     logger.info("Agent session started, waiting for user speech...")
     # Use session.say() instead of generate_reply so the greeting goes directly to TTS
     # without an LLM call (avoids "no user query" error with Qwen and similar models)
-    if past_messages:
-        greeting = "Welcome back! I remember our previous conversation. What would you like to talk about?"
-    else:
-        greeting = "Hi there! I'm Kay, your personal voice assistant. How can I help you today?"
-        
-    # H3: Persist and publish greeting immediately so that it is added to the log, ChatContext, and UI
-    chat_ctx.add_message(role="assistant", content=greeting)
-    
     session.say(greeting)
 
 
