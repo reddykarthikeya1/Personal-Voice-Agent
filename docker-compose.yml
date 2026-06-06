@@ -18,31 +18,31 @@ services:
       start_period: 15s
 
   whisper:
-    image: fedirz/faster-whisper-server:latest-cpu
+    # GPU build of faster-whisper-server, running the most accurate Whisper model
+    # (large-v3) on the RTX 3060. int8_float16 keeps VRAM low so it shares the GPU
+    # with Kokoro. (Was: CPU image + the tiny, inaccurate base model.)
+    image: fedirz/faster-whisper-server:latest-cuda
     restart: always
     ports:
       - "8083:8000"
     environment:
-      - WHISPER__MODEL=Systran/faster-whisper-base
+      - WHISPER__MODEL=Systran/faster-whisper-large-v3
+      - WHISPER__INFERENCE_DEVICE=cuda
+      - WHISPER__COMPUTE_TYPE=int8_float16
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/v1/models\")'"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 15s
-
-  tts:
-    build: ./tts-service
-    restart: always
-    ports:
-      - "8082:8082"
-    # X16: Added start_period to tts service healthcheck
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8082/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 15s
+      # First boot downloads the ~3GB large-v3 model, so allow plenty of warm-up time.
+      start_period: 300s
 
   db:
     image: postgres:15-alpine
@@ -70,15 +70,13 @@ services:
     environment:
       - LIVEKIT_URL=ws://livekit-server:7880
       - OPENAI_STT_BASE_URL=http://whisper:8000/v1
-      - OPENAI_TTS_BASE_URL=http://tts:8082/v1
       - KOKORO_TTS_URL=http://kokoro-tts:8880/v1
-      - TTS_PROVIDER=edge-tts
     depends_on:
       livekit-server:
         condition: service_healthy
       whisper:
         condition: service_healthy
-      tts:
+      kokoro-tts:
         condition: service_healthy
       db:
         condition: service_healthy
@@ -126,16 +124,24 @@ services:
       start_period: 15s
 
   kokoro-tts:
-    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    # GPU build so synthesis is near-instant on the RTX 3060 (was the CPU image).
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
     restart: always
     ports:
       - "8880:8880"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8880/health\")'"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 15s
+      start_period: 120s
 
 volumes:
   pgdata:

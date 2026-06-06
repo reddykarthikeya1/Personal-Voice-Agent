@@ -470,24 +470,19 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.info("User selected voice: %s", selected_voice)
             break
 
-    # L11 & X14: Handle dynamic TTS Providers (edge-tts vs kokoro-tts) with Kokoro voice mapping
-    tts_provider = os.getenv("TTS_PROVIDER", "edge-tts").lower()
-    tts_voice = selected_voice
-    if tts_provider == "kokoro":
-        KOKORO_VOICE_MAP = {
-            "alloy": "af_bella",
-            "nova": "af_nicole",
-            "shimmer": "af_sarah",
-            "echo": "am_adam",
-            "onyx": "am_michael",
-            "fable": "bf_emma",
-        }
-        tts_voice = KOKORO_VOICE_MAP.get(selected_voice, "af_bella")
-        tts_base_url = os.getenv("KOKORO_TTS_URL", "http://kokoro-tts:8880/v1")
-        logger.info("Initializing Kokoro-TTS at %s with voice %s (mapped from %s)", tts_base_url, tts_voice, selected_voice)
-    else:
-        tts_base_url = os.getenv("OPENAI_TTS_BASE_URL", "http://tts:8082/v1")
-        logger.info("Initializing Edge-TTS at %s with voice %s", tts_base_url, tts_voice)
+    # TTS is Kokoro (running on GPU). Edge-TTS has been removed. Map the UI's voice
+    # names to Kokoro voices.
+    KOKORO_VOICE_MAP = {
+        "alloy": "af_bella",
+        "nova": "af_nicole",
+        "shimmer": "af_sarah",
+        "echo": "am_adam",
+        "onyx": "am_michael",
+        "fable": "bf_emma",
+    }
+    tts_voice = KOKORO_VOICE_MAP.get(selected_voice, "af_bella")
+    tts_base_url = os.getenv("KOKORO_TTS_URL", "http://kokoro-tts:8880/v1")
+    logger.info("Initializing Kokoro-TTS at %s with voice %s (mapped from %s)", tts_base_url, tts_voice, selected_voice)
 
     tts_instance = openai.TTS(
         model=os.getenv("OPENAI_TTS_MODEL", "tts-1"),

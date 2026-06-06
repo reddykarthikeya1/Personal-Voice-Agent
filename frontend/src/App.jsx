@@ -36,13 +36,16 @@ const getTokenServerUrl = () => {
 
 const TOKEN_SERVER_URL = getTokenServerUrl();
 
+// Labels reflect the actual Kokoro voices the agent maps these values to
+// (see KOKORO_VOICE_MAP in backend/agent.py). The value keys are kept so no
+// backend change is needed.
 const VOICE_OPTIONS = [
-  { value: 'alloy', label: 'Kay (Default Female - Aria)' },
-  { value: 'nova', label: 'Jenny (Soft Female - Jenny)' },
-  { value: 'shimmer', label: 'Amber (Warm Female - Amber)' },
-  { value: 'echo', label: 'Guy (Smooth Male - Guy)' },
-  { value: 'onyx', label: 'Davis (Deep Male - Davis)' },
-  { value: 'fable', label: 'Sonia (British Female - Sonia)' },
+  { value: 'alloy', label: 'Bella (Female · warm)' },        // af_bella
+  { value: 'nova', label: 'Nicole (Female · soft)' },        // af_nicole
+  { value: 'shimmer', label: 'Sarah (Female)' },             // af_sarah
+  { value: 'echo', label: 'Adam (Male)' },                   // am_adam
+  { value: 'onyx', label: 'Michael (Male · deep)' },         // am_michael
+  { value: 'fable', label: 'Emma (Female · British)' },      // bf_emma
 ];
 
 const fetchConversationsAPI = async () => {
